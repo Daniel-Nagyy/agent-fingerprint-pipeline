@@ -32,7 +32,7 @@ export) in parallel, resumably.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/agent-fingerprint-pipeline
+git clone https://github.com/Daniel-Nagyy/agent-fingerprint-pipeline
 cd agent-fingerprint-pipeline
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
@@ -103,8 +103,16 @@ Batch-only: `--workers N` (parallel repos, default 4), `--retry-failed`,
 - **API cost per repo:** 1 GraphQL query for metadata, 1 GraphQL query per
   50 PRs (each about 3 points), and 3 REST calls. With one token that is
   roughly 1,500 repos/hour on the REST budget; in practice cloning is the
-  bottleneck. A live run on a 185-repo gitcorpus corpus is described
-  below.
+  bottleneck. The 185-repo gitcorpus corpus took 10 minutes with 8
+  workers (see Testing).
+- **No working tree.** Clones use `--no-checkout`: LOC and file markers
+  are read from git's object store. Large repos used to spend most of
+  their time writing (and, on Windows, virus-scanning) files only to
+  count lines; this made the same corpus run 3x faster.
+- **Flaky networks.** A clone that fails on the network is retried four
+  times and then fails the repo, so `--retry-failed` redoes it. It is
+  never mistaken for an empty window: only git's own "no commits after
+  that date" answer leads to the depth-1 clone.
 
 ## Output
 
@@ -188,6 +196,9 @@ authorship, and never label a PR or commit.
   parent otherwise means rebase; a one-commit PR is `squash_or_rebase`.
   Squash commits are excluded from edit-velocity ranking, as the
   methodology asks.
+- **PR evidence includes outsiders.** An agent PR can be a drive-by
+  contribution that is never merged; `agent_prs_merged` counts the ones
+  the maintainers accepted.
 - **Merge commits** have no diff stats in `git log --numstat` (one row per
   commit), and they are excluded from edit-velocity ranking too.
 - Detection is a **lower bound**: agents that leave no trace are
@@ -228,7 +239,7 @@ Added: the 29-brand roster with file markers, agent-written message
 markers and AI reviewers; GraphQL repo metadata and PR pages; merge-method
 inference and PR-to-commit label propagation; `--until` and `--as-of`;
 the `batch` and `report` commands with corpus-level CSVs; public rulesets
-for "review required"; and 86 new tests.
+for "review required"; no-checkout clones; and 88 new tests.
 
 ## Testing
 
@@ -237,7 +248,7 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-117 tests. They cover:
+119 tests. They cover:
 
 - the signature roster, with real true and false positives;
 - label priority and PR propagation;
@@ -259,3 +270,11 @@ Live checks run against the real API:
 - A 12-repo pilot took about 2 minutes and 70 requests. The Vim plugins
   and the `osman-haider` case that free-text matching had flagged now come
   out clean.
+- The full 185-repo gitcorpus corpus (window 2025-08-12 to 2026-02-21,
+  `--as-of 2026-02-21`, 8 workers) took 10.1 minutes and 944 requests,
+  with 0 failures. 125 repos met every eligibility rule and 20 showed
+  agent traces. Every Claude Code PR hit that the earlier detection run
+  had not reported was checked by hand: each is the agent's own
+  "Generated with [Claude Code]" footer or a `claude/` branch. Window
+  commit counts for the repos that had disagreed between test runs now
+  match `git rev-list` exactly.
