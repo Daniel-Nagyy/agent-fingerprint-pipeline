@@ -221,6 +221,25 @@ def test_edit_velocity_tolerates_missing_dates():
     compute_edit_velocity(commits)  # used to raise TypeError comparing naive and aware datetimes
 
 
+def test_clone_retries_network_errors_then_falls_back_to_depth_1(monkeypatch, tmp_path):
+    from afp import collect
+    calls = []
+
+    def fake_git(args, cwd, timeout=120):
+        calls.append(args)
+        if len(calls) == 1:
+            raise collect.GitCommandError("fatal: unable to access 'https://github.com/o/r.git/': "
+                                          "Failed to connect to github.com port 443")
+        if "--shallow-since" in args:
+            raise collect.GitCommandError("fatal: error processing shallow info: 4")
+        return ""
+    monkeypatch.setattr(collect, "_run_git", fake_git)
+    monkeypatch.setattr(collect, "CLONE_RETRY_SECONDS", 0)
+    collect.clone_repo("https://github.com/o/r.git", str(tmp_path / "r"), shallow_since="2026-02-22")
+    assert ["--shallow-since" in c for c in calls] == [True, True, False]   # retry, then depth-1 fallback
+    assert "--depth" in calls[-1] and "--no-checkout" in calls[-1]
+
+
 # --- end to end + batch ----------------------------------------------------
 
 @pytest.fixture

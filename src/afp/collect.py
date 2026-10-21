@@ -24,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, NamedTuple, Optional
@@ -133,14 +134,36 @@ def clone_repo(clone_url: str, dest_dir: str, shallow_since: Optional[str] = Non
         args += ["--shallow-since", shallow_since]
     elif depth:
         args += ["--depth", str(depth)]
+    def _clone(clone_args: List[str]) -> None:
+        for attempt in range(CLONE_ATTEMPTS):
+            remove_tree(str(dest))
+            try:
+                _run_git(clone_args + [clone_url, str(dest)], cwd=str(dest.parent), timeout=timeout)
+                return
+            except GitCommandError as exc:
+                if attempt == CLONE_ATTEMPTS - 1 or not _is_network_error(str(exc)):
+                    raise
+                time.sleep(CLONE_RETRY_SECONDS * (attempt + 1))
+
     try:
-        _run_git(args + [clone_url, str(dest)], cwd=str(dest.parent), timeout=timeout)
+        _clone(args)
     except GitCommandError:
         if not shallow_since:
             raise
-        remove_tree(str(dest))
-        _run_git(base + ["--depth", "1", clone_url, str(dest)], cwd=str(dest.parent), timeout=timeout)
+        _clone(base + ["--depth", "1"])
     return str(dest)
+
+
+CLONE_ATTEMPTS = 3
+CLONE_RETRY_SECONDS = 10
+_NETWORK_ERRORS = ("unable to access", "could not resolve host", "failed to connect", "early eof",
+                   "rpc failed", "timed out", "connection reset", "connection was reset",
+                   "remote end hung up", "gnutls", "schannel", "http/2 stream")
+
+
+def _is_network_error(message: str) -> bool:
+    low = message.lower()
+    return any(s in low for s in _NETWORK_ERRORS)
 
 
 def is_shallow(repo_path: str) -> bool:
