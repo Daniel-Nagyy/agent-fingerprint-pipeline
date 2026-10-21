@@ -50,7 +50,7 @@ BOOLEAN_FEATURES = ["has_conventional_prefix", "is_merge", "edit_velocity_flagge
 
 def load_feature_table(jsonl_path: str) -> pd.DataFrame:
     rows = []
-    with open(jsonl_path) as f:
+    with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:

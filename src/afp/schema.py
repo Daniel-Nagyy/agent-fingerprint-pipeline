@@ -32,11 +32,15 @@ class RepoMetadata:
     created_at: Optional[str] = None         # ISO 8601
     primary_language: Optional[str] = None
     languages: Dict[str, int] = field(default_factory=dict)   # bytes per language
-    total_loc: Optional[int] = None          # approximate, from languages API or cloc
-    commit_count: Optional[int] = None
+    total_loc: Optional[int] = None          # lines in source/config files at the clone's HEAD
+    language_bytes: Optional[int] = None     # sum of the languages API byte counts
+    commit_count: Optional[int] = None       # full default-branch history, not just the window
+    commit_count_source: Optional[str] = None  # "graphql" / "git" / None
     contributor_count: Optional[int] = None
+    is_solo: Optional[bool] = None           # contributor_count == 1
     default_branch: str = "main"
-    branch_protection: Optional[bool] = None  # None = unknown/unchecked
+    branch_protection: Optional[bool] = None  # review required on the default branch; None = unknown
+    branch_protection_source: Optional[str] = None  # "rulesets" / "classic" / None
     stack_tag: Optional[str] = None           # coarse tag, e.g. "Python", "JS/TS"
     size_tier: Optional[str] = None           # "small" / "medium" / "large"
 
@@ -69,6 +73,8 @@ class LabelSignal:
     """
     has_trailer: bool = False
     trailer_text: Optional[str] = None
+    message_marker_match: bool = False
+    message_marker_text: Optional[str] = None
     is_bot_account: bool = False
     bot_account_login: Optional[str] = None
     email_domain_match: bool = False
@@ -79,6 +85,8 @@ class LabelSignal:
     agent_brand: Optional[str] = None   # resolved brand, or "unknown"
     label_source: Optional[str] = None  # "trailer" / "bot_account" / "email_domain" / "pr_marker" / None
     label: str = "unlabeled"            # "agent_labeled" or "unlabeled" -- never "human"
+    brands: List[str] = field(default_factory=list)  # every brand any signal named
+    propagated_from_pr: Optional[int] = None         # PR number when labelled via its merge
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -132,7 +140,8 @@ class PullRequestRecord:
     created_at: Optional[str] = None
     merged_at: Optional[str] = None
     merge_commit_sha: Optional[str] = None
-    merged_via: Optional[str] = None       # "merge" / "squash" / "rebase"
+    merged_via: Optional[str] = None       # "merge" / "squash" / "rebase" / "squash_or_rebase"
+    commit_count: Optional[int] = None     # commits on the PR branch
 
     additions: int = 0
     deletions: int = 0
@@ -141,9 +150,12 @@ class PullRequestRecord:
 
     review_comment_count: int = 0
     review_depth: Optional[float] = None    # review_comment_count / pr_size
-    first_review_at: Optional[str] = None
+    first_review_at: Optional[str] = None   # first review by someone other than the author or a bot
     review_latency_seconds: Optional[float] = None
+    first_approval_at: Optional[str] = None
+    approval_latency_seconds: Optional[float] = None
     rubber_stamp_flag: bool = False         # zero comments + fast approval
+    ai_reviewers: List[str] = field(default_factory=list)  # AI review bots that reviewed or commented
 
     label: LabelSignal = field(default_factory=LabelSignal)
 
@@ -200,6 +212,46 @@ class CommitFeatureVector:
     # (never a ground-truth "0 = human"); kept here only for training/eval
     # convenience and must be dropped for genuine inference on new data.
     pu_label: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Repo-level adoption roll-up
+# --------------------------------------------------------------------------
+
+@dataclass
+class FileMarker:
+    path: str
+    marker: str
+    brand: str
+    first_added_at: Optional[str] = None   # earliest commit in the collected history adding it
+    first_added_sha: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RepoAdoption:
+    """One row per repo: which agents left traces, through which source,
+    and how much of the collected window they account for."""
+    full_name: str
+    commits_in_window: int = 0
+    agent_commits: int = 0
+    agent_commit_share: Optional[float] = None
+    prs_collected: int = 0
+    agent_prs: int = 0
+    agent_pr_share: Optional[float] = None
+    brands: List[str] = field(default_factory=list)          # every brand seen anywhere
+    primary_brands: List[str] = field(default_factory=list)  # restricted to the methodology's five
+    commit_brand_counts: Dict[str, int] = field(default_factory=dict)
+    pr_brand_counts: Dict[str, int] = field(default_factory=dict)
+    file_marker_brands: List[str] = field(default_factory=list)
+    label_source_counts: Dict[str, int] = field(default_factory=dict)
+    first_agent_commit_at: Optional[str] = None
+    ai_reviewers: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

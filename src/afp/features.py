@@ -5,6 +5,13 @@ explicit label-source signal stripped out -- this is the boundary that
 keeps the PU-learning setup honest (schema.py's docstring on
 CommitFeatureVector explains why).
 
+Message features are computed on the message with every explicit agent
+signal removed first (agent co-author trailers, "Generated with ..."
+lines, task links, an "aider: " prefix). Otherwise message length and
+line count would carry the label itself -- a Claude Code commit is two
+lines longer purely because of its trailer -- and the classifier would
+relearn the heuristic instead of a fingerprint.
+
 compute_commit_features() assumes compute_edit_velocity() (collect.py)
 has already annotated the commits it's given, since edit velocity needs
 the whole per-author commit sequence and can't be computed one commit
@@ -18,7 +25,9 @@ from datetime import datetime
 from typing import List, Optional
 
 from . import config
+from . import signatures as sig_db
 from .collect import _classify_file  # reuse the same file-type classifier
+from .heuristics import _trailer_brand
 from .schema import CommitRecord, CommitFeatureVector
 
 _CONVENTIONAL_PREFIX_RE = re.compile(
@@ -44,6 +53,30 @@ def _parse_dt(s: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(s)
     except ValueError:
         return None
+
+
+_ROBOT_LINE_RE = re.compile(r"^\s*\U0001F916\s*generated (?:with|by)\b.*$", re.IGNORECASE)
+
+
+def strip_label_signals(message: str) -> str:
+    """The message with every explicit agent signal removed (see the
+    module docstring). Human co-author trailers are kept."""
+    if not message:
+        return ""
+    kept = []
+    for i, line in enumerate(message.splitlines()):
+        m = sig_db.TRAILER_RE.match(line)
+        if m and _trailer_brand(m.group("name") or "", m.group("email") or ""):
+            continue
+        if _ROBOT_LINE_RE.match(line) or any(p.search(line) for _, p in sig_db.BODY_MARKER_PATTERNS):
+            continue
+        if i == 0:
+            for _, p in sig_db.SUBJECT_PREFIX_PATTERNS:
+                line = p.sub("", line, count=1)
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept)
 
 
 def _message_features(message: str):
@@ -77,10 +110,12 @@ def _file_type_mix(file_paths: List[str]):
 
 
 def commit_to_feature_vector(commit: CommitRecord) -> CommitFeatureVector:
-    length, line_count, has_prefix, template_likeness = _message_features(commit.message)
+    length, line_count, has_prefix, template_likeness = _message_features(strip_label_signals(commit.message))
     frac_source, frac_docs, frac_config, frac_test = _file_type_mix(commit.file_paths)
 
-    dt = _parse_dt(commit.commit_date or commit.author_date)
+    # author date: when (and in which timezone) the change was written.
+    # The committer date of a squash or rebase merge is GitHub's merge time.
+    dt = _parse_dt(commit.author_date or commit.commit_date)
     hour_of_day = dt.hour if dt else None
     day_of_week = dt.weekday() if dt else None
 

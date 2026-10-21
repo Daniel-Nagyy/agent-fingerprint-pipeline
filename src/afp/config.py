@@ -12,7 +12,7 @@ from __future__ import annotations
 # Repo eligibility (Table: "Repo eligibility and time window parameters")
 # ---------------------------------------------------------------------------
 
-MIN_LOC = 5_000
+MIN_LOC = 5_000                   # lines of text in recognised source/doc/config files
 MIN_COMMITS = 100
 MIN_STARS = 10
 ALLOW_FORKS = False
@@ -30,52 +30,21 @@ SIZE_TIER_BOUNDARIES = {
 # Agent identification (Table: "Agent identification parameters")
 # ---------------------------------------------------------------------------
 
-# Top five brands per Robbes et al. (2026) adoption figures.
-AGENT_BRANDS = ["claude_code", "copilot", "codex", "gemini", "cursor"]
+# Top five brands per Robbes et al. (2026) adoption figures. The full
+# roster (bot logins, e-mails, trailers, body markers, branch prefixes,
+# labels, file markers) lives in signatures.py; every other brand found
+# there is still detected and reported, just outside the primary five.
+from .signatures import PRIMARY_BRANDS as _PRIMARY_BRANDS
 
-# Co-author trailer patterns -> brand. Matched case-insensitively against
-# "Co-authored-by: <name> <<email>>" trailer lines in the commit message.
-TRAILER_BRAND_PATTERNS = {
-    "claude_code": [r"claude", r"claude code"],
-    "copilot": [r"copilot"],
-    "codex": [r"codex", r"openai"],
-    "gemini": [r"gemini", r"antigravity"],
-    "cursor": [r"cursor"],
-}
+AGENT_BRANDS = list(_PRIMARY_BRANDS)
 
-# Known bot account logins (GitHub `author.type == "Bot"` plus well-known
-# app-bot usernames). Extend as new tool bots are identified.
-BOT_ACCOUNT_LOGINS = {
-    "github-actions[bot]": None,          # not an agent brand, CI bot -- excluded from agent labeling
-    "copilot-swe-agent[bot]": "copilot",
-    "copilot[bot]": "copilot",
-    "claude[bot]": "claude_code",
-    "cursor[bot]": "cursor",
-    "codex[bot]": "codex",
-    "gemini-code-assist[bot]": "gemini",
-}
-# Logins mapped to None are recognised bots but NOT counted as agent-authored
-# (e.g. plain CI bots unrelated to coding agents).
-
-# Known committer/author e-mail domains associated with an agent brand.
-EMAIL_DOMAIN_BRANDS = {
-    "noreply@anthropic.com": "claude_code",
-    "noreply.anthropic.com": "claude_code",
-    "openai.com": "codex",
-    "github.com": None,  # too generic (covers normal noreply GitHub emails) -- not used alone
-}
-
-# Substrings searched for in PR title/body/branch-name/labels.
-PR_MARKER_PATTERNS = {
-    "claude_code": [r"claude code", r"claude-code", r"\bclaude\b"],
-    "copilot": [r"copilot"],
-    "codex": [r"\bcodex\b"],
-    "gemini": [r"gemini", r"antigravity"],
-    "cursor": [r"\bcursor\b"],
-}
-
-# Label-source priority, checked in this order (per methodology Notes item 2).
-LABEL_SOURCE_PRIORITY = ["trailer", "bot_account", "email_domain", "pr_marker"]
+# Label-source priority, checked in this order (per methodology Notes
+# item 2: trailer > bot account > PR marker). "message_marker" (an
+# agent-written line such as "Generated with Claude Code" in the commit
+# body) sits with the trailer as commit-text evidence; "email_domain"
+# (an agent's exact author/committer address) is the git-side form of a
+# bot account.
+LABEL_SOURCE_PRIORITY = ["trailer", "message_marker", "bot_account", "email_domain", "pr_marker"]
 
 LABEL_AGENT = "agent_labeled"
 LABEL_UNLABELED = "unlabeled"   # never "human" -- see Positive/Unlabeled framing
@@ -110,6 +79,14 @@ EDIT_VELOCITY_FLAG_PERCENTILE = 95  # top 5% flagged as high-velocity
 
 RUBBER_STAMP_MAX_COMMENTS = 0
 RUBBER_STAMP_MAX_LATENCY_SECONDS = 15 * 60  # "fast approval" -- 15 minutes; group to confirm
+
+# ---------------------------------------------------------------------------
+# Collection limits (keep corpus-scale runs inside the API budget)
+# ---------------------------------------------------------------------------
+
+PR_PAGE_SIZE = 50             # PRs per GraphQL page (reviews nested)
+MAX_PRS_PER_REPO = 300        # newest PRs collected per repo; 0 = no cap
+LOC_MAX_FILE_BYTES = 2_000_000  # files larger than this are not line-counted
 
 # ---------------------------------------------------------------------------
 # Stack / language tagging

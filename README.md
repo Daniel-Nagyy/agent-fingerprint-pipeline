@@ -1,158 +1,261 @@
 # Agent Fingerprint Pipeline (AFP)
 
 A repo-to-features pipeline for the thesis *"Identifying Coding-Agent
-Fingerprints in Commit Metadata"*. Implements, end to end, the parameters
-agreed in `Shared_Corpus_Methodology.tex` and the detection/feature design
-from the proposal:
+Fingerprints in Commit Metadata"*. It implements the parameters agreed in
+the group's shared corpus methodology, from repo eligibility to a
+classifier-ready feature table, and runs on a single repo or a whole
+corpus (for example a frozen [gitcorpus](https://github.com/Thabettt/gitcorpus)
+export) in parallel, resumably.
 
-1. **Repo eligibility + metadata** (stars, forks, archived, push recency,
-   LOC, branch protection, contributor count) via the GitHub REST API.
-2. **Commit collection** via `git clone` + `git log` parsing (the same
-   approach Robbes et al. themselves use, not the API).
-3. **PR collection** (title/body/branch/labels, reviews, review comments)
-   via the GitHub REST API.
-4. **Explicit-signal heuristics**: commit trailer / bot account / e-mail
-   domain / PR marker detection, with brand resolution and the group's
-   label-source priority. Output is always `agent_labeled` or
-   `unlabeled` — **never** `human`, since absence of a signal is not
-   evidence of human authorship (see the Positive/Unlabeled framing in
-   the proposal).
-5. **Feature extraction**: message, timing, diff, file-type-mix, merge
-   type, and edit velocity — with every raw label-source signal stripped
-   out before the vector is handed to a model.
-6. **Classifier training stub**: logistic regression / gradient boosting
-   baseline, repo-level train/test split, SHAP-ready.
+1. **Repo eligibility + metadata**: stars, fork/archived, push recency,
+   lines of code (counted from the clone), full commit count, contributor
+   count, and "review required" on the default branch.
+2. **Commit collection** via `git clone` + `git log` (the approach
+   Robbes et al. use), bounded to a date window.
+3. **PR collection** via GraphQL: title/body/branch/labels, author,
+   merge method, reviews, review threads, AI reviewers.
+4. **Explicit-signal heuristics** for **29 named agent brands** (plus
+   `unknown`) across six
+   channels: commit trailers, agent-written message markers, bot
+   accounts, agent e-mail addresses, PR markers (branch prefix / label /
+   body), and repo file markers (`CLAUDE.md`, `.cursorrules`,
+   `.github/copilot-instructions.md`, ...). Labels follow the group's
+   source priority, and the output is always `agent_labeled` or
+   `unlabeled`, **never** `human`.
+5. **Feature extraction**: message, timing, diff, file-type mix, merge
+   type and edit velocity, with every label-source signal stripped
+   *before* the features are computed.
+6. **Adoption roll-ups** per repo and per corpus.
+7. **Classifier baseline**: logistic regression / gradient boosting,
+   repo-level train/test split, PU-learning-aware.
 
 ## Install
 
 ```bash
-cd agent_fingerprint_pipeline
+git clone https://github.com/<you>/agent-fingerprint-pipeline
+cd agent-fingerprint-pipeline
+python -m venv .venv
+# Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Needs Python 3.9+ and `git` on the PATH. Commands below assume
+`PYTHONPATH=src` (or run them from `src/`).
+
+```bash
+export PYTHONPATH=src                 # PowerShell: $env:PYTHONPATH = 'src'
+export GITHUB_TOKEN=github_pat_...     # PowerShell: $env:GITHUB_TOKEN = '...'
+```
+
+A fine-grained token with **no scopes** is enough for public repos.
+Without a token the pipeline runs in git-only mode (commits, file markers,
+LOC and features; no PRs, stars, contributors or eligibility verdict).
 
 ## Quick start
 
 ```bash
-# Git-only mode (no token needed): clones the repo, mines commits, extracts
-# features. Skips anything that needs the REST API (eligibility, PR data).
-python -m afp.cli run octocat/Hello-World --out ./out/hello_world
+# One repo, commits from the data-collection start date onward
+python -m afp.cli run spf13/viper --out ./out/viper --since 2026-02-22
 
-# Full mode: set a real GitHub personal access token (public_repo scope is
-# enough; no scope at all is needed for public repos on a fine-grained PAT)
-export GITHUB_TOKEN=ghp_your_token_here
-python -m afp.cli run octocat/Hello-World --out ./out/hello_world
+# A whole corpus: a gitcorpus corpus.csv (any CSV with a full_name column)
+# or a text file with one owner/repo per line
+python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --workers 8
 
-# Restrict to commits after the group's agreed data-collection start date
-python -m afp.cli run octocat/Hello-World --out ./out/hello_world --since 2026-02-22
+# Pilot on the first 20 repos, then run the rest with the same command
+python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --limit 20
 
-# Train the baseline classifier on the resulting features.jsonl
-python -m afp.cli train ./out/hello_world/features.jsonl --out model.joblib
+# Re-print the corpus summary / rebuild the merged files
+python -m afp.cli report ./out/corpus
+
+# Train the baseline classifier on every repo's commits
+python -m afp.cli train ./out/corpus/features.jsonl --out model.joblib --model gboost
+
+# Check your token and the API layer
+python -m afp.cli smoke-test-api readthedocs/sphinx_rtd_theme
 ```
 
-Output files per repo (`--out DIR`):
-- `commits.jsonl` — one `CommitRecord` per line (raw data + label metadata).
-- `prs.jsonl` — one `PullRequestRecord` per line (empty if no token, or `--no-prs`).
-- `features.jsonl` — one `CommitFeatureVector` per line (what actually feeds the classifier).
-- `summary.json` — run mode, notes, and counts.
+Window options (`run` and `batch`):
 
-## Package layout
+| Option | Meaning |
+|---|---|
+| `--since YYYY-MM-DD` | First day of the window. The clone is shallow from this date, which keeps large repos cheap. |
+| `--until YYYY-MM-DD` | Last day of the window (commits and PRs). |
+| `--as-of YYYY-MM-DD` | Date the "pushed in the last 12 months" rule is measured from (default: today). |
+| `--max-prs N` | Newest PRs per repo (default 300; `0` = every PR in the window). |
+| `--no-prs` | Skip PR collection. |
 
-```
-src/afp/
-  schema.py        dataclasses: RepoMetadata, EligibilityResult, LabelSignal,
-                    CommitRecord, PullRequestRecord, CommitFeatureVector
-  config.py         every group-agreed constant (thresholds, brand/email/bot maps, priority order)
-  heuristics.py     explicit-signal detection + label resolution (trailer > bot > email > PR marker)
-  collect.py        git clone + git log parsing; edit-velocity computation
-  github_client.py  thin REST client, reads GITHUB_TOKEN
-  eligibility.py     repo metadata + eligibility verdict
-  pr_collect.py     PR-level record building (review depth, rubber-stamp flag, etc.)
-  features.py       CommitRecord -> CommitFeatureVector (strips label-source columns)
-  pipeline.py       orchestrator: clone -> collect -> (eligibility/PRs) -> features -> export
-  classifier.py     baseline training stub (PU-learning-aware, repo-level split)
-  cli.py            `run` / `smoke-test-api` / `train` subcommands
-tests/              pytest suite (see "Testing notes" below)
-```
+Batch-only: `--workers N` (parallel repos, default 4), `--retry-failed`,
+`--limit N`, `--keep-clones`, `--work-dir DIR`.
 
-## Testing notes — what was actually run, and what wasn't
+### Running on a large corpus
 
-This tool was built inside a sandboxed agentic environment with the
-following constraints, which shaped how it was tested:
+- **Resumable.** Each repo writes `repos/<owner>__<repo>/summary.json`
+  last. Re-running the same command skips finished repos (and failed ones
+  unless `--retry-failed`), so Ctrl+C, a crash or a reboot loses at most
+  the repos in flight.
+- **One bad repo never stops the run.** Deleted, renamed, private or huge
+  repos are recorded as `failed` with the error and the batch continues.
+- **Rate limits are handled.** All workers share one client that retries
+  500/502/503/504 and network errors with backoff, and waits for the
+  primary and secondary rate limits to reset (logged with `-v`).
+- **Disk stays small.** Clones are deleted as soon as a repo is done, so
+  only about `--workers` clones exist at once.
+- **API cost per repo:** 1 GraphQL query for metadata, 1 GraphQL query per
+  50 PRs (each about 3 points), and 3 REST calls. With one token that is
+  roughly 1,500 repos/hour on the REST budget; in practice cloning is the
+  bottleneck. A live run on a 185-repo gitcorpus corpus is described
+  below.
 
-- **Anonymous `git clone`/`fetch` of any public GitHub repo works** with
-  no setup, through the sandbox's own git proxy. So `collect.py`
-  (commit collection, edit velocity, the explicit-signal heuristics) was
-  **live-tested** against a real cloned repo (`octocat/Hello-World`) —
-  see the merge-commit numstat gap it surfaced below — *and* against a
-  hand-built synthetic repo with known ground truth (trailer commit,
-  bot-email commit, lockfile commit, plain human commits), reproduced in
-  `tests/conftest.py`'s `synthetic_repo` fixture.
-- **The GitHub REST/GraphQL API does not work from inside this sandbox**
-  without attaching the target repo with push-level credentials, which
-  would have been disproportionate just to test a read-only client
-  against someone else's public demo repo. So `github_client.py` and
-  `pr_collect.py` were tested against **mocked HTTP responses** shaped
-  like the real documented API (`tests/test_github_client.py`,
-  `tests/test_pr_collect.py`), not against the live API.
-- **You should smoke-test the API client yourself** with your own token:
-  ```bash
-  export GITHUB_TOKEN=ghp_your_token_here
-  python -m afp.cli smoke-test-api octocat/Hello-World
-  ```
-  This hits `/repos`, `/languages`, `/pulls`, `/pulls/{n}/reviews` and
-  `/pulls/{n}/comments` for real and prints what comes back. If it fails,
-  the pipeline's `run` command degrades gracefully to git-only mode
-  rather than crashing (see `pipeline.run_pipeline`'s try/except around
-  the API stage) — this was itself caught live: this sandbox injects a
-  placeholder `GITHUB_TOKEN` that looks set but isn't a real credential,
-  and the first version of the orchestrator crashed on it. Worth keeping
-  in mind if your own token is wrong/expired — you'll get a note in
-  `summary.json` instead of a silent wrong answer.
+## Output
 
-### Things the live test against `octocat/Hello-World` actually caught
+Per repo (`run --out DIR`, or `batch`'s `repos/<owner>__<repo>/`):
 
-- `git log --numstat` reports **no diff stats for merge commits** by
-  default (needs `-m`/`--cc`, which changes the semantics in ways that
-  don't match "one row per commit"). The merge commit in that repo comes
-  through with `additions=0, deletions=0, files_changed=0`. This is the
-  exact squash/merge imprecision flagged as an open methodology question
-  — it's now something you can point to concretely rather than just
-  suspect.
-- `add_delete_ratio = +inf` whenever a commit has zero deletions (common
-  for new files) crashes scikit-learn's imputer outright
-  (`ValueError: Input X contains infinity`). Fixed in
-  `classifier.load_feature_table` by coercing `inf`/`-inf` to `NaN` before
-  imputation; regression-tested in `tests/test_classifier.py`.
+| File | Contents |
+|---|---|
+| `commits.jsonl` | One `CommitRecord` per commit in the window: raw data + full label evidence. |
+| `prs.jsonl` | One `PullRequestRecord` per PR (empty without a token or with `--no-prs`). |
+| `features.jsonl` | One `CommitFeatureVector` per commit: what feeds the classifier. |
+| `file_markers.jsonl` | Agent configuration files present at HEAD, with the commit that first added each. |
+| `summary.json` | Status, mode, window, notes, repo metadata, eligibility, adoption roll-up. |
 
-### Running the tests
+Corpus level (`batch --out DIR`, rebuilt by `report`):
+
+| File | Contents |
+|---|---|
+| `repos.csv` | One row per repo: metadata, eligibility verdict + reasons, adoption (brands, agent commit/PR shares, first agent commit, AI reviewers). |
+| `adoption_by_brand.csv` | Repos / agent commits / agent PRs per brand, for all repos and for eligible repos only. |
+| `file_markers.csv` | Every agent config file found, with its first-added date. |
+| `commits.jsonl`, `prs.jsonl`, `features.jsonl` | All repos concatenated (`features.jsonl` is the training set). |
+| `corpus_summary.json` | Headline numbers. |
+
+CSV files are UTF-8 with a BOM so Excel opens them correctly.
+
+## Detection
+
+Signatures live in `src/afp/signatures.py`. The roster follows Robbes et
+al.'s validated heuristic set (file markers, commit trailers, branch
+names, PR labels), extended with the bot accounts, e-mail addresses and
+body markers the agents write themselves. The five methodology brands
+(`claude_code`, `copilot`, `codex`, `gemini`, `cursor`) are reported as
+`primary_brands`. Everything else (Aider, Devin, Jules, Junie, OpenHands,
+Windsurf, Cline, Amazon Q, ...) is still detected and reported, and generic
+traces (`AGENTS.md`, an `ai-generated` label) map to `unknown`.
+
+**Every pattern is anchored** to where the agent writes it:
+
+| Channel | Matches | Does not match |
+|---|---|---|
+| Trailer | `Co-authored-by: Cursor <cursoragent@cursor.com>`, `Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>`, a noreply address of an agent account | `Co-authored-by: Claude Martin <claude.martin@example.com>` |
+| Message marker | `🤖 Generated with [Claude Code]`, a `chatgpt.com/codex/tasks/` link, an `aider: ` subject | "Move cursor to the next line" |
+| Bot account / e-mail | `copilot-swe-agent[bot]`, `google-labs-jules[bot]`, `noreply@anthropic.com` | `osman-haider`, `someone@openai.com` |
+| PR marker | branch `codex/...`, `claude/...`; label `codex`; body marker | title "Fix cursor jumps", branch `docs/copilot` |
+| File marker | `CLAUDE.md`, `.cursor/`, `.github/copilot-instructions.md`, `AGENTS.md` | `src/cursor.py`, `docs/claude.md` |
+
+Free-text matching ("cursor", "claude" anywhere in a message, a login
+merely *containing* "aider") was the main false-positive source in an
+earlier detection run on the same corpus. `tests/test_signatures.py`
+keeps those real cases as regression tests.
+
+**Label-source priority:** trailer > message marker > bot account >
+e-mail > PR marker. When an agent PR is merged, its label is propagated to
+the squash or merge commit GitHub created, as the lowest-priority source
+(`propagated_from_pr`). Every brand any signal named is kept in
+`label.brands`.
+
+**AI reviewers** (CodeRabbit, Copilot review, Gemini Code Assist, ...) are
+recorded per PR in `ai_reviewers`. They are review adoption, not
+authorship, and never label a PR or commit.
+
+## Methodology notes and limitations
+
+- **Lines of code** are counted from the clone: lines in tracked source
+  and config files at HEAD (docs, binaries and files over 2 MB excluded).
+  The languages API reports bytes, not lines.
+- **Commit count** for the `>= 100` rule is the full default-branch
+  history from GraphQL, not the shallow clone's window.
+- **Review required / branch protection** comes from the public rulesets
+  endpoint first. Classic protection is usually unreadable without push
+  access, so `None` ("unknown") is still common.
+- **Review depth** uses review *threads* (one per inline comment chain)
+  from GraphQL. Exact comment counts cost about 6× more GraphQL points per
+  page. `build_pr_record` (REST) still counts individual comments for spot
+  checks.
+- **Review latency** ignores reviews by the PR author and by bots. The
+  **rubber-stamp flag** is zero review threads plus an *approval* within
+  `RUBBER_STAMP_MAX_LATENCY_SECONDS` (15 min placeholder; group to agree).
+- **Merge method** is inferred from the merge commit: two parents means
+  merge; one parent with GitHub's default `(#N)` title means squash; one
+  parent otherwise means rebase; a one-commit PR is `squash_or_rebase`.
+  Squash commits are excluded from edit-velocity ranking, as the
+  methodology asks.
+- **Merge commits** have no diff stats in `git log --numstat` (one row per
+  commit), and they are excluded from edit-velocity ranking too.
+- Detection is a **lower bound**: agents that leave no trace are
+  invisible, so `unlabeled` is never treated as human (PU framing).
+- The classifier is still a baseline: no per-brand holdout,
+  manual-label comparison or SHAP wiring yet.
+
+## Changes from the first version
+
+Bugs fixed:
+
+- **Windows crashes on non-ASCII text.** Output files and `git log` were
+  read and written in the console code page, so the 🤖 in "Generated with
+  Claude Code" crashed the run. Everything is now UTF-8.
+- **Free-text false positives**: brand words in messages, titles and
+  bodies, `openai.com` addresses, logins containing brand names (see
+  Detection).
+- **`compute_edit_velocity` crashed** (`TypeError`) when any commit lacked
+  a date: a naive `datetime.min` was compared with git's offset-aware
+  dates.
+- **LOC was bytes.** The 5,000 "lines" threshold was compared with the
+  languages API's byte count.
+- **Commit count came from the window.** With `--since` the clone is
+  shallow, so `len(commits)` failed the `>= 100` rule for most repos.
+- **Message features leaked the label.** A trailer adds length and lines
+  to the message, so the classifier could relearn the heuristic. Signals
+  are now stripped first (`features.strip_label_signals`).
+- **Rubber stamp** counted any first review, including bots, rather than
+  a fast *approval*.
+- **The API client** never retried 5xx errors, ignored secondary rate
+  limits and 429s, and raised on connection resets.
+- **git could hang** waiting for credentials on a deleted or private repo.
+  Prompts are now disabled.
+- Hour/day of week now use the author date: the committer date of a
+  squash or rebase merge is GitHub's merge time.
+
+Added: the 29-brand roster with file markers, agent-written message
+markers and AI reviewers; GraphQL repo metadata and PR pages; merge-method
+inference and PR-to-commit label propagation; `--until` and `--as-of`;
+the `batch` and `report` commands with corpus-level CSVs; public rulesets
+for "review required"; and 86 new tests.
+
+## Testing
 
 ```bash
-pip install -r requirements.txt pytest
+pip install -r requirements.txt
 pytest -q
 ```
 
-31 tests, all passing as of this build: heuristics (label priority, bot
-vs. CI-bot distinction, "no signal ≠ human"), commit collection against
-the synthetic ground-truth repo, edit-velocity flagging and its
-squash/mechanical-diff exclusions, feature stripping, mocked API/PR
-parsing, and the classifier's infinity-sanitization fix.
+117 tests. They cover:
 
-## Known limitations (carried over from the proposal/methodology, not new)
+- the signature roster, with real true and false positives;
+- label priority and PR propagation;
+- commit collection, windowing and Unicode against local git repos with
+  known ground truth;
+- LOC and file markers;
+- edit velocity, including its exclusions;
+- feature stripping and leakage;
+- the API client's retry and rate-limit handling and GraphQL parsing
+  (mocked);
+- merge-method inference;
+- an end-to-end git-only run;
+- batch resume and failure isolation.
 
-- `merged_via` (merge vs. squash vs. rebase) is **not yet resolved
-  automatically** — GitHub's PR API doesn't return it directly; it needs
-  a follow-up `compare` call the orchestrator doesn't make yet. Until
-  then, `collect.py` only ever sets `merge_type="merge"` for multi-parent
-  commits and `None` otherwise — squash-merged PRs collapse into a single
-  commit that looks like one big human (or unlabeled) edit, which is the
-  exact imprecision the methodology already flags.
-- `rubber_stamp_flag`'s 15-minute "fast approval" threshold
-  (`config.RUBBER_STAMP_MAX_LATENCY_SECONDS`) is a placeholder — the
-  group still needs to agree on the real value.
-- The classifier stub has no per-brand holdout, no manual-label
-  comparison, and no SHAP wiring yet — it's the scaffold the proposal's
-  "Models and Evaluation" section describes, not the finished evaluation.
-- Branch protection checks return `None` ("unknown") very often on public
-  repos, since GitHub requires push access to read that endpoint for most
-  repositories — this matches the methodology's own "recorded as metadata,
-  not a filter" treatment of that field.
+Live checks run against the real API:
+
+- `smoke-test-api` on `readthedocs/sphinx_rtd_theme` found its Codex
+  (`codex/...` branch) and Copilot (`copilot-swe-agent`) PRs.
+- A 12-repo pilot took about 2 minutes and 70 requests. The Vim plugins
+  and the `osman-haider` case that free-text matching had flagged now come
+  out clean.

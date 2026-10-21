@@ -24,7 +24,8 @@ def test_build_pr_record_rubber_stamp_flag():
         "changed_files": 1,
     })
     client.list_pr_reviews = MagicMock(return_value=[
-        {"submitted_at": "2026-03-01T10:05:00Z"},  # 5 min after creation
+        {"submitted_at": "2026-03-01T10:05:00Z", "state": "APPROVED",
+         "user": {"login": "reviewer"}},  # approved 5 min after creation
     ])
     client.list_pr_review_comments = MagicMock(return_value=[])  # zero comments
 
@@ -32,7 +33,8 @@ def test_build_pr_record_rubber_stamp_flag():
     assert record.pr_size == 3
     assert record.review_comment_count == 0
     assert record.review_latency_seconds == 300.0
-    assert record.rubber_stamp_flag is True  # 0 comments + 5 min < 15 min threshold
+    assert record.approval_latency_seconds == 300.0
+    assert record.rubber_stamp_flag is True  # 0 comments + approved 5 min < 15 min threshold
 
 
 def test_build_pr_record_not_rubber_stamp_when_commented():
@@ -51,7 +53,8 @@ def test_build_pr_record_not_rubber_stamp_when_commented():
         "deletions": 10,
         "changed_files": 3,
     })
-    client.list_pr_reviews = MagicMock(return_value=[{"submitted_at": "2026-03-01T10:10:00Z"}])
+    client.list_pr_reviews = MagicMock(return_value=[{"submitted_at": "2026-03-01T10:10:00Z", "state": "APPROVED",
+                                                        "user": {"login": "reviewer"}}])
     client.list_pr_review_comments = MagicMock(return_value=[{"id": 1}, {"id": 2}])
 
     record = build_pr_record(client, "o", "r", 2)

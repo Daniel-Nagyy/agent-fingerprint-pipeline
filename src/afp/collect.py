@@ -6,9 +6,11 @@ mining) rather than going through the GitHub API for commit history --
 it's cheaper, has no rate limit, and works on any public repo with a
 plain anonymous `git clone`.
 
-Two public entry points:
+Public entry points:
   - clone_repo(url, dest, shallow_since=None) -> path to the clone
-  - collect_commits(repo_path, repo_full_name, branch=None) -> List[CommitRecord]
+  - collect_commits(repo_path, repo_full_name, branch=None, since=None, until=None)
+  - count_loc(repo_path) -> lines in recognised source/config files at HEAD
+  - find_file_markers(repo_path) -> agent configuration files present at HEAD
 
 compute_edit_velocity() is a separate pass so it can be unit-tested against
 a hand-built list of CommitRecord objects without touching git at all.
@@ -19,15 +21,16 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import statistics
+import stat
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 from . import config
-from .schema import CommitRecord
+from .schema import CommitRecord, FileMarker
 from .heuristics import resolve_label
+from .signatures import file_marker_brand
 
 # Field/record separators chosen to be control characters that will not
 # plausibly appear in a commit message.
@@ -45,6 +48,23 @@ _LOCK_FILE_NAMES = {
     "gemfile.lock", "cargo.lock", "composer.lock", "pipfile.lock",
 }
 
+# Never let git stop and wait for a username/password (a deleted or
+# private repo answers anonymous clones with an auth challenge), and read
+# its output as UTF-8 regardless of the console code page.
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+_GIT_CONFIG = ["-c", "core.quotepath=off", "-c", "i18n.logOutputEncoding=UTF-8",
+               "-c", "credential.helper=", "-c", "core.longpaths=true"]
+
+# "Lines of code": source and config files. Docs (.md/.rst/.txt) are left
+# out, otherwise an awesome-list README counts as thousands of lines of code.
+_CODE_EXTENSIONS = (
+    config.FILE_TYPE_GROUPS["source"] | config.FILE_TYPE_GROUPS["config"]
+    | {".sh", ".bash", ".ps1", ".css", ".scss", ".less", ".html", ".htm", ".vue",
+       ".svelte", ".sql", ".m", ".mm", ".r", ".jl", ".lua", ".pl", ".pm", ".ex",
+       ".exs", ".erl", ".hs", ".ml", ".clj", ".dart", ".groovy", ".gradle", ".vim",
+       ".el", ".zig", ".nim", ".xml", ".proto", ".tf", ".cmake", ".mk"}
+)
+
 
 class GitCommandError(RuntimeError):
     pass
@@ -53,12 +73,15 @@ class GitCommandError(RuntimeError):
 def _run_git(args: List[str], cwd: str, timeout: int = 120) -> str:
     try:
         result = subprocess.run(
-            ["git"] + args,
+            ["git"] + _GIT_CONFIG + args,
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
+            env={**os.environ, **_GIT_ENV},
         )
     except subprocess.TimeoutExpired as e:
         raise GitCommandError(f"git {' '.join(args)} timed out") from e
@@ -69,29 +92,121 @@ def _run_git(args: List[str], cwd: str, timeout: int = 120) -> str:
     return result.stdout
 
 
+def remove_tree(path: str) -> None:
+    """shutil.rmtree that also removes git's read-only pack files on Windows."""
+    def _onerror(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    if Path(path).exists():
+        shutil.rmtree(path, onerror=_onerror)
+
+
 def clone_repo(clone_url: str, dest_dir: str, shallow_since: Optional[str] = None,
-                depth: Optional[int] = None) -> str:
-    """Anonymously clone a public repo. Returns the local path.
+               depth: Optional[int] = None, timeout: int = 900) -> str:
+    """Anonymously clone a public repo's default branch. Returns the path.
 
     `shallow_since` (YYYY-MM-DD) matches the methodology's data-collection
     start date when we only need commits after that point; `depth` is used
     instead for a quick-and-dirty "last N commits" style fetch (useful for
     smoke tests). Passing neither does a full clone.
+
+    A repo with no commit after `shallow_since` makes git refuse the
+    shallow clone; it is retried at depth 1 so the working tree (LOC, file
+    markers) is still available, and collect_commits' own `since` filter
+    then correctly yields zero commits.
     """
     dest = Path(dest_dir)
-    if dest.exists():
-        shutil.rmtree(dest)
+    remove_tree(str(dest))
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    args = ["clone"]
+    base = ["clone", "--single-branch", "--no-tags"]
+    args = list(base)
     if shallow_since:
         args += ["--shallow-since", shallow_since]
     elif depth:
         args += ["--depth", str(depth)]
-    args += [clone_url, str(dest)]
-
-    _run_git(args, cwd=str(dest.parent), timeout=600)
+    try:
+        _run_git(args + [clone_url, str(dest)], cwd=str(dest.parent), timeout=timeout)
+    except GitCommandError:
+        if not shallow_since:
+            raise
+        remove_tree(str(dest))
+        _run_git(base + ["--depth", "1", clone_url, str(dest)], cwd=str(dest.parent), timeout=timeout)
     return str(dest)
+
+
+def is_shallow(repo_path: str) -> bool:
+    return _run_git(["rev-parse", "--is-shallow-repository"], cwd=repo_path).strip() == "true"
+
+
+def count_commits(repo_path: str) -> int:
+    """Commits reachable from HEAD in the clone (the full history only
+    when the clone is not shallow; see is_shallow)."""
+    return int(_run_git(["rev-list", "--count", "HEAD"], cwd=repo_path).strip() or 0)
+
+
+def tracked_files(repo_path: str) -> List[str]:
+    raw = _run_git(["ls-files", "-z"], cwd=repo_path, timeout=300)
+    return [p for p in raw.split("\0") if p]
+
+
+def count_loc(repo_path: str, files: Optional[List[str]] = None) -> int:
+    """Lines in tracked files with a recognised source or config
+    extension at HEAD (docs excluded). Binary files (a NUL byte in the first 8 KiB) and
+    files over config.LOC_MAX_FILE_BYTES (vendored bundles, data dumps)
+    are skipped. This is what the methodology's ">= 5,000 lines of code"
+    threshold is checked against -- not the languages API, which counts
+    bytes."""
+    total = 0
+    root = Path(repo_path)
+    for rel in files if files is not None else tracked_files(repo_path):
+        base = rel.rsplit("/", 1)[-1].lower()
+        ext = "." + base.rsplit(".", 1)[-1] if "." in base else base
+        if ext not in _CODE_EXTENSIONS:
+            continue
+        path = root / rel
+        try:
+            if not path.is_file() or path.stat().st_size > config.LOC_MAX_FILE_BYTES:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue
+        total += data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+    return total
+
+
+def find_file_markers(repo_path: str, files: Optional[List[str]] = None,
+                      max_markers: int = 50) -> List[FileMarker]:
+    """Agent configuration files present at HEAD (CLAUDE.md, .cursorrules,
+    .github/copilot-instructions.md, ...), each with the earliest commit
+    in the collected history that added it -- the repo's adoption date
+    for that tool, as far as the clone's history reaches."""
+    markers: List[FileMarker] = []
+    seen = set()
+    for rel in files if files is not None else tracked_files(repo_path):
+        hit = file_marker_brand(rel)
+        if not hit:
+            continue
+        marker, brand = hit
+        # one row per marker per directory is enough (.claude/ can hold dozens of files)
+        key = (marker, rel.rsplit("/", 1)[0] if marker.endswith("/") else rel)
+        if key in seen:
+            continue
+        seen.add(key)
+        fm = FileMarker(path=rel, marker=marker, brand=brand)
+        try:
+            out = _run_git(["log", "--diff-filter=A", f"--format=%H{_FIELD_SEP}%aI", "--", rel],
+                           cwd=repo_path, timeout=120).strip().splitlines()
+            if out:
+                fm.first_added_sha, fm.first_added_at = out[-1].split(_FIELD_SEP, 1)
+        except GitCommandError:
+            pass
+        markers.append(fm)
+        if len(markers) >= max_markers:
+            break
+    return markers
 
 
 def _classify_file(path: str) -> str:
@@ -117,6 +232,19 @@ def _classify_file(path: str) -> str:
     if ext in config.FILE_TYPE_GROUPS["source"]:
         return "source"
     return "other"
+
+
+_RENAME_BRACE_RE = re.compile(r"\{([^{}]*) => ([^{}]*)\}")
+
+
+def _normalize_numstat_path(fname: str) -> str:
+    """numstat prints renames as `src/{old => new}/f.py` or `old => new`;
+    keep the new path."""
+    if " => " not in fname:
+        return fname
+    if "{" in fname:
+        return re.sub(r"/{2,}", "/", _RENAME_BRACE_RE.sub(lambda m: m.group(2), fname)).strip("/")
+    return fname.split(" => ", 1)[1]
 
 
 def _parse_log_output(raw: str, repo_full_name: str) -> List[CommitRecord]:
@@ -152,7 +280,7 @@ def _parse_log_output(raw: str, repo_full_name: str) -> List[CommitRecord]:
             if len(parts) != 3:
                 continue
             add_s, del_s, fname = parts
-            file_paths.append(fname)
+            file_paths.append(_normalize_numstat_path(fname))
             # binary files report "-" for add/del
             if add_s.isdigit():
                 additions += int(add_s)
@@ -179,7 +307,7 @@ def _parse_log_output(raw: str, repo_full_name: str) -> List[CommitRecord]:
         )
         commit.label = resolve_label(
             commit_message=message,
-            author_login=None,   # not available from git log alone; filled in later if PR data joins it
+            author_login=None,   # git log has no logins; noreply addresses are resolved via the e-mail
             author_email=ae,
             committer_email=ce,
         )
@@ -188,12 +316,21 @@ def _parse_log_output(raw: str, repo_full_name: str) -> List[CommitRecord]:
 
 
 def collect_commits(repo_path: str, repo_full_name: str,
-                     branch: Optional[str] = None) -> List[CommitRecord]:
-    """Parse `git log` into a list of CommitRecord (no edit velocity yet)."""
+                    branch: Optional[str] = None, since: Optional[str] = None,
+                    until: Optional[str] = None) -> List[CommitRecord]:
+    """Parse `git log` into a list of CommitRecord (no edit velocity yet).
+
+    `since`/`until` (YYYY-MM-DD) bound the commit date, so a shallow
+    clone's boundary commit, or the single commit of a depth-1 fallback
+    clone, never leaks into the window."""
     args = ["log", f"--pretty=format:{_LOG_FORMAT}", "--numstat"]
+    if since:
+        args.append(f"--since={since}T00:00:00Z")
+    if until:
+        args.append(f"--until={until}T23:59:59Z")
     if branch:
-        args.insert(1, branch)
-    raw = _run_git(args, cwd=repo_path, timeout=300)
+        args.append(branch)
+    raw = _run_git(args, cwd=repo_path, timeout=900)
     return _parse_log_output(raw, repo_full_name)
 
 
@@ -209,8 +346,23 @@ def _is_mechanical_diff(commit: CommitRecord) -> bool:
     return False
 
 
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# an aware sentinel: comparing datetime.min (naive) with git's
+# offset-carrying dates raises TypeError as soon as one date is missing
+_EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
+
+
 def compute_edit_velocity(commits: List[CommitRecord],
-                           percentile: int = config.EDIT_VELOCITY_FLAG_PERCENTILE) -> None:
+                          percentile: int = config.EDIT_VELOCITY_FLAG_PERCENTILE) -> None:
     """Annotate commits in place with seconds_since_author_prev_commit,
     edit_velocity, edit_velocity_flagged and edit_velocity_excluded_reason.
 
@@ -218,17 +370,10 @@ def compute_edit_velocity(commits: List[CommitRecord],
     author_date. Squash-merge commits and mechanical diffs (lockfiles)
     are excluded from the percentile ranking per the methodology's note,
     but still get an excluded_reason recorded rather than being dropped.
+    Merge commits are excluded too: git reports no diff stats for them.
     """
     def _author_key(c: CommitRecord) -> str:
         return (c.author_email or c.author_name or "unknown").lower()
-
-    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-        if not s:
-            return None
-        try:
-            return datetime.fromisoformat(s)
-        except ValueError:
-            return None
 
     by_author: dict[str, List[CommitRecord]] = {}
     for c in commits:
@@ -237,7 +382,7 @@ def compute_edit_velocity(commits: List[CommitRecord],
     velocities_eligible: List[float] = []
 
     for author, author_commits in by_author.items():
-        author_commits.sort(key=lambda c: _parse_dt(c.author_date) or datetime.min)
+        author_commits.sort(key=lambda c: _parse_dt(c.author_date) or _EARLIEST)
         prev_dt: Optional[datetime] = None
         for c in author_commits:
             dt = _parse_dt(c.author_date)
@@ -250,6 +395,8 @@ def compute_edit_velocity(commits: List[CommitRecord],
                     excluded_reason = None
                     if c.merge_type == "squash":
                         excluded_reason = "squash_merge"
+                    elif c.is_merge:
+                        excluded_reason = "merge_commit"
                     elif _is_mechanical_diff(c):
                         excluded_reason = "mechanical_diff"
                     c.edit_velocity_excluded_reason = excluded_reason
@@ -264,10 +411,11 @@ def compute_edit_velocity(commits: List[CommitRecord],
 
     threshold = _percentile(velocities_eligible, percentile)
     for c in commits:
-        if (c.edit_velocity is not None
-                and c.edit_velocity_excluded_reason is None
-                and c.edit_velocity >= threshold):
-            c.edit_velocity_flagged = True
+        c.edit_velocity_flagged = bool(
+            c.edit_velocity is not None
+            and c.edit_velocity_excluded_reason is None
+            and c.edit_velocity >= threshold
+        )
 
 
 def _percentile(values: List[float], pct: int) -> float:

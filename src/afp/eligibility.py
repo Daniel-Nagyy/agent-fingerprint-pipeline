@@ -2,10 +2,14 @@
 Repo eligibility + metadata checks, per the "Repo eligibility and time
 window" table in Shared_Corpus_Methodology.tex.
 
-build_repo_metadata() turns a raw `get_repo` response (plus a couple of
-follow-up calls) into a RepoMetadata record. check_eligibility() applies
-the group's thresholds and returns a pass/fail with reasons, so a
-rejected repo's reasons can be logged rather than silently dropped.
+build_repo_metadata() gathers a RepoMetadata record in three requests:
+one GraphQL query (stars, fork/archived, push date, languages, default
+branch and its full commit count), one REST call for the contributor
+count, and the publicly readable rulesets endpoint for "review
+required". Lines of code come from the clone (collect.count_loc), not
+the API. check_eligibility() applies the group's thresholds and returns
+a pass/fail with reasons, so a rejected repo's reasons can be logged
+rather than silently dropped.
 """
 
 from __future__ import annotations
@@ -16,6 +20,17 @@ from typing import Optional
 from . import config
 from .github_client import GitHubClient
 from .schema import RepoMetadata, EligibilityResult
+
+REPO_QUERY = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner stargazerCount isFork isArchived pushedAt createdAt
+    primaryLanguage { name }
+    languages(first: 30, orderBy: {field: SIZE, direction: DESC}) { edges { size node { name } } }
+    defaultBranchRef { name target { ... on Commit { history { totalCount } } } }
+  }
+}
+"""
 
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -40,26 +55,34 @@ def _size_tier(total_loc: Optional[int]) -> Optional[str]:
 
 
 def build_repo_metadata(client: GitHubClient, owner: str, repo: str,
-                         fetch_contributors: bool = True,
-                         fetch_branch_protection: bool = True) -> RepoMetadata:
-    raw = client.get_repo(owner, repo)
-    languages = client.get_languages(owner, repo)
-    total_loc = sum(languages.values()) if languages else None  # bytes, used as a size proxy
+                        fetch_contributors: bool = True,
+                        fetch_branch_protection: bool = True,
+                        total_loc: Optional[int] = None) -> RepoMetadata:
+    data = client.graphql(REPO_QUERY, {"owner": owner, "name": repo})
+    raw = data.get("repository")
+    if raw is None:
+        raise LookupError(f"{owner}/{repo} not found (deleted, renamed away or private)")
+
+    languages = {e["node"]["name"]: e["size"] for e in (raw.get("languages") or {}).get("edges") or []}
+    branch = raw.get("defaultBranchRef") or {}
+    history = ((branch.get("target") or {}).get("history") or {})
 
     meta = RepoMetadata(
         owner=owner,
         name=repo,
-        full_name=raw.get("full_name", f"{owner}/{repo}"),
-        stars=raw.get("stargazers_count", 0) or 0,
-        is_fork=bool(raw.get("fork", False)),
-        is_archived=bool(raw.get("archived", False)),
-        pushed_at=raw.get("pushed_at"),
-        created_at=raw.get("created_at"),
-        primary_language=raw.get("language"),
-        languages=languages or {},
+        full_name=raw.get("nameWithOwner") or f"{owner}/{repo}",
+        stars=raw.get("stargazerCount") or 0,
+        is_fork=bool(raw.get("isFork")),
+        is_archived=bool(raw.get("isArchived")),
+        pushed_at=raw.get("pushedAt"),
+        created_at=raw.get("createdAt"),
+        primary_language=(raw.get("primaryLanguage") or {}).get("name"),
+        languages=languages,
+        language_bytes=sum(languages.values()) if languages else None,
         total_loc=total_loc,
-        commit_count=None,  # filled in from collect.collect_commits() by the orchestrator
-        default_branch=raw.get("default_branch", "main"),
+        commit_count=history.get("totalCount"),
+        commit_count_source="graphql" if history.get("totalCount") is not None else None,
+        default_branch=branch.get("name") or "main",
     )
     meta.stack_tag = config.LANGUAGE_TO_STACK_TAG.get(meta.primary_language or "", meta.primary_language)
     meta.size_tier = _size_tier(meta.total_loc)
@@ -67,12 +90,14 @@ def build_repo_metadata(client: GitHubClient, owner: str, repo: str,
     if fetch_contributors:
         try:
             meta.contributor_count = client.get_contributors_count(owner, repo)
+            meta.is_solo = meta.contributor_count == 1
         except Exception:
             meta.contributor_count = None
 
     if fetch_branch_protection:
         try:
-            meta.branch_protection = client.get_branch_protection(owner, repo, meta.default_branch)
+            meta.branch_protection, meta.branch_protection_source = client.review_required(
+                owner, repo, meta.default_branch)
         except Exception:
             meta.branch_protection = None
 
@@ -80,10 +105,11 @@ def build_repo_metadata(client: GitHubClient, owner: str, repo: str,
 
 
 def check_eligibility(meta: RepoMetadata, commit_count: Optional[int] = None,
-                       now: Optional[datetime] = None) -> EligibilityResult:
-    """Apply the group's eligibility thresholds. `commit_count` can be
-    supplied separately (e.g. from collect.collect_commits) since the
-    REST API does not give an exact commit count directly."""
+                      now: Optional[datetime] = None) -> EligibilityResult:
+    """Apply the group's eligibility thresholds. `commit_count` overrides
+    meta.commit_count when given; it must be the repo's full history
+    (a shallow clone's window count is not), so the pipeline passes it
+    only for unshallow clones."""
     now = now or datetime.now(timezone.utc)
     reasons = []
 
@@ -109,6 +135,8 @@ def check_eligibility(meta: RepoMetadata, commit_count: Optional[int] = None,
 
     if meta.total_loc is not None and meta.total_loc < config.MIN_LOC:
         reasons.append(f"total_loc {meta.total_loc} < minimum {config.MIN_LOC}")
+    elif meta.total_loc is None:
+        reasons.append("total_loc unknown (no clone)")
 
     effective_commit_count = commit_count if commit_count is not None else meta.commit_count
     if effective_commit_count is not None and effective_commit_count < config.MIN_COMMITS:

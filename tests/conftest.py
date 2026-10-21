@@ -27,9 +27,11 @@ def _run(cmd, cwd, env=None):
     subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True, env=env)
 
 
-@pytest.fixture
-def synthetic_repo(tmp_path) -> str:
-    repo_dir = tmp_path / "synthetic-repo"
+@pytest.fixture(scope="session")
+def synthetic_repo(tmp_path_factory) -> str:
+    # session-scoped: no test mutates it, and building it per test spawned
+    # ~20 git processes each time (slow on Windows)
+    repo_dir = tmp_path_factory.mktemp("synthetic") / "synthetic-repo"
     repo_dir.mkdir()
     repo = str(repo_dir)
 
