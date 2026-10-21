@@ -23,9 +23,10 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 from . import config
 from .schema import CommitRecord, FileMarker
@@ -103,7 +104,14 @@ def remove_tree(path: str) -> None:
 
 def clone_repo(clone_url: str, dest_dir: str, shallow_since: Optional[str] = None,
                depth: Optional[int] = None, timeout: int = 900) -> str:
-    """Anonymously clone a public repo's default branch. Returns the path.
+    """Anonymously clone a public repo's default branch without a working
+    tree. Returns the path.
+
+    Nothing downstream needs files on disk: commits come from `git log`,
+    and LOC and file markers read HEAD's tree from the object store
+    (head_tree / count_loc). Skipping the checkout avoids writing tens of
+    thousands of files per large repo -- the slowest step of a corpus run,
+    especially on Windows, where each written file is virus-scanned.
 
     `shallow_since` (YYYY-MM-DD) matches the methodology's data-collection
     start date when we only need commits after that point; `depth` is used
@@ -111,7 +119,7 @@ def clone_repo(clone_url: str, dest_dir: str, shallow_since: Optional[str] = Non
     smoke tests). Passing neither does a full clone.
 
     A repo with no commit after `shallow_since` makes git refuse the
-    shallow clone; it is retried at depth 1 so the working tree (LOC, file
+    shallow clone; it is retried at depth 1 so HEAD's tree (LOC, file
     markers) is still available, and collect_commits' own `since` filter
     then correctly yields zero commits.
     """
@@ -119,7 +127,7 @@ def clone_repo(clone_url: str, dest_dir: str, shallow_since: Optional[str] = Non
     remove_tree(str(dest))
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    base = ["clone", "--single-branch", "--no-tags"]
+    base = ["clone", "--single-branch", "--no-tags", "--no-checkout"]
     args = list(base)
     if shallow_since:
         args += ["--shallow-since", shallow_since]
@@ -145,35 +153,82 @@ def count_commits(repo_path: str) -> int:
     return int(_run_git(["rev-list", "--count", "HEAD"], cwd=repo_path).strip() or 0)
 
 
+class TreeEntry(NamedTuple):
+    path: str
+    oid: str
+    size: int
+
+
+def head_tree(repo_path: str) -> List[TreeEntry]:
+    """Every file blob in HEAD's tree, with its object id and size
+    (submodules and symlinks excluded). Works on a --no-checkout clone."""
+    raw = _run_git(["ls-tree", "-r", "-l", "-z", "HEAD"], cwd=repo_path, timeout=300)
+    entries = []
+    for rec in raw.split("\0"):
+        if not rec or "\t" not in rec:
+            continue
+        meta, path = rec.split("\t", 1)
+        parts = meta.split()
+        if len(parts) != 4 or parts[1] != "blob" or parts[0] == "120000" or not parts[3].isdigit():
+            continue
+        entries.append(TreeEntry(path, parts[2], int(parts[3])))
+    return entries
+
+
 def tracked_files(repo_path: str) -> List[str]:
-    raw = _run_git(["ls-files", "-z"], cwd=repo_path, timeout=300)
-    return [p for p in raw.split("\0") if p]
+    return [e.path for e in head_tree(repo_path)]
 
 
-def count_loc(repo_path: str, files: Optional[List[str]] = None) -> int:
-    """Lines in tracked files with a recognised source or config
-    extension at HEAD (docs excluded). Binary files (a NUL byte in the first 8 KiB) and
-    files over config.LOC_MAX_FILE_BYTES (vendored bundles, data dumps)
-    are skipped. This is what the methodology's ">= 5,000 lines of code"
-    threshold is checked against -- not the languages API, which counts
-    bytes."""
-    total = 0
-    root = Path(repo_path)
-    for rel in files if files is not None else tracked_files(repo_path):
-        base = rel.rsplit("/", 1)[-1].lower()
-        ext = "." + base.rsplit(".", 1)[-1] if "." in base else base
-        if ext not in _CODE_EXTENSIONS:
-            continue
-        path = root / rel
+def _is_code_path(path: str) -> bool:
+    base = path.rsplit("/", 1)[-1].lower()
+    ext = "." + base.rsplit(".", 1)[-1] if "." in base else base
+    return ext in _CODE_EXTENSIONS
+
+
+def count_loc(repo_path: str, entries: Optional[List[TreeEntry]] = None) -> int:
+    """Lines in HEAD's source and config files (docs excluded), read from
+    the object store with one `git cat-file --batch` stream. Binary files
+    (a NUL byte in the first 8 KiB) and files over config.LOC_MAX_FILE_BYTES
+    (vendored bundles, data dumps) are skipped. This is what the
+    methodology's ">= 5,000 lines of code" threshold is checked against --
+    not the languages API, which counts bytes."""
+    wanted = [e for e in (entries if entries is not None else head_tree(repo_path))
+              if e.size <= config.LOC_MAX_FILE_BYTES and _is_code_path(e.path)]
+    if not wanted:
+        return 0
+    proc = subprocess.Popen(["git", "cat-file", "--batch"], cwd=repo_path, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env={**os.environ, **_GIT_ENV})
+
+    def _feed():
         try:
-            if not path.is_file() or path.stat().st_size > config.LOC_MAX_FILE_BYTES:
+            for e in wanted:
+                proc.stdin.write(e.oid.encode("ascii") + b"\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    writer = threading.Thread(target=_feed, daemon=True)
+    writer.start()
+    total = 0
+    try:
+        out = proc.stdout
+        for _ in wanted:
+            header = out.readline()
+            if not header:
+                break
+            parts = header.split()
+            if len(parts) < 3 or parts[1] == b"missing":
                 continue
-            data = path.read_bytes()
-        except OSError:
-            continue
-        if b"\0" in data[:8192]:
-            continue
-        total += data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+            data = out.read(int(parts[2]))
+            out.read(1)  # the newline git appends after each object
+            if b"\0" in data[:8192]:
+                continue
+            total += data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+    finally:
+        writer.join(timeout=30)
+        proc.stdout.close()
+        proc.wait(timeout=60)
     return total
 
 

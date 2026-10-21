@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from .adoption import summarize_repo
 from .collect import (clone_repo, collect_commits, compute_edit_velocity, count_commits,
-                      count_loc, find_file_markers, is_shallow, remove_tree, tracked_files)
+                      count_loc, find_file_markers, head_tree, is_shallow, remove_tree)
 from .features import commits_to_feature_vectors
 from .heuristics import apply_pr_label
 from .schema import EligibilityResult, RepoAdoption, RepoMetadata
@@ -118,9 +118,9 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
         commits = collect_commits(clone_path, full_name, branch=branch, since=shallow_since, until=until)
         result.commits = commits
 
-        files = tracked_files(clone_path)
-        total_loc = count_loc(clone_path, files)
-        result.file_markers = find_file_markers(clone_path, files)
+        tree = head_tree(clone_path)
+        total_loc = count_loc(clone_path, tree)
+        result.file_markers = find_file_markers(clone_path, [e.path for e in tree])
         git_commit_count = None if is_shallow(clone_path) else count_commits(clone_path)
 
         meta = RepoMetadata(owner=owner, name=repo, full_name=full_name, total_loc=total_loc,
