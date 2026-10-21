@@ -243,6 +243,7 @@ class RepoAdoption:
     agent_commit_share: Optional[float] = None
     prs_collected: int = 0
     agent_prs: int = 0
+    agent_prs_merged: int = 0     # merged agent PRs: adoption by the maintainers, not drive-by PRs
     agent_pr_share: Optional[float] = None
     brands: List[str] = field(default_factory=list)          # every brand seen anywhere
     primary_brands: List[str] = field(default_factory=list)  # restricted to the methodology's five

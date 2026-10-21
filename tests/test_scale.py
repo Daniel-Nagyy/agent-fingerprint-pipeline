@@ -261,6 +261,7 @@ def test_run_pipeline_git_only_end_to_end(local_clone, tmp_path):
     assert result.adoption.agent_commits == 1
     assert result.adoption.brands == ["claude_code"]
     assert result.adoption.file_marker_brands == ["claude_code"]
+    assert result.adoption.agent_prs_merged == 0              # git-only: no PRs
     assert not (tmp_path / "work" / "o__r").exists()          # clone removed
     paths = pipeline.export_jsonl(result, str(tmp_path / "out"))
     summary = json.loads(Path(paths["summary.json"]).read_text(encoding="utf-8"))
