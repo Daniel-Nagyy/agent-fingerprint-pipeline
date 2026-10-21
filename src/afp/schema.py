@@ -1,0 +1,205 @@
+"""
+Shared data structures for the Agent Fingerprint Pipeline (AFP).
+
+These mirror the parameters agreed in Shared_Corpus_Methodology.tex
+(repo eligibility, agent identification, commit-level features,
+PR-level features, stack/language tagging) so that every stage of
+the pipeline writes and reads the same fields.
+
+Nothing here performs I/O. Dataclasses are kept intentionally close
+to "plain dicts with a schema" so they serialize to JSONL/CSV cleanly.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Any
+
+
+# --------------------------------------------------------------------------
+# Repo-level
+# --------------------------------------------------------------------------
+
+@dataclass
+class RepoMetadata:
+    owner: str
+    name: str
+    full_name: str
+    stars: int = 0
+    is_fork: bool = False
+    is_archived: bool = False
+    pushed_at: Optional[str] = None          # ISO 8601
+    created_at: Optional[str] = None         # ISO 8601
+    primary_language: Optional[str] = None
+    languages: Dict[str, int] = field(default_factory=dict)   # bytes per language
+    total_loc: Optional[int] = None          # approximate, from languages API or cloc
+    commit_count: Optional[int] = None
+    contributor_count: Optional[int] = None
+    default_branch: str = "main"
+    branch_protection: Optional[bool] = None  # None = unknown/unchecked
+    stack_tag: Optional[str] = None           # coarse tag, e.g. "Python", "JS/TS"
+    size_tier: Optional[str] = None           # "small" / "medium" / "large"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EligibilityResult:
+    full_name: str
+    eligible: bool
+    reasons: List[str] = field(default_factory=list)  # failed-check explanations
+    checked_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Commit-level
+# --------------------------------------------------------------------------
+
+@dataclass
+class LabelSignal:
+    """Raw, retained-as-metadata label evidence for one commit.
+
+    Per the methodology's Agent Identification table, these signals are
+    kept as metadata and stripped from the model's feature set before
+    training -- the classifier must not simply relearn the heuristic.
+    """
+    has_trailer: bool = False
+    trailer_text: Optional[str] = None
+    is_bot_account: bool = False
+    bot_account_login: Optional[str] = None
+    email_domain_match: bool = False
+    email_domain: Optional[str] = None
+    pr_marker_match: bool = False
+    pr_marker_text: Optional[str] = None
+
+    agent_brand: Optional[str] = None   # resolved brand, or "unknown"
+    label_source: Optional[str] = None  # "trailer" / "bot_account" / "email_domain" / "pr_marker" / None
+    label: str = "unlabeled"            # "agent_labeled" or "unlabeled" -- never "human"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CommitRecord:
+    repo_full_name: str
+    sha: str
+    author_name: Optional[str] = None
+    author_email: Optional[str] = None
+    committer_name: Optional[str] = None
+    committer_email: Optional[str] = None
+    author_date: Optional[str] = None     # ISO 8601
+    commit_date: Optional[str] = None     # ISO 8601, i.e. the "event date"
+    message: str = ""
+    parents: List[str] = field(default_factory=list)
+    is_merge: bool = False
+    merge_type: Optional[str] = None      # "merge" / "squash" / "rebase" / None (regular commit)
+
+    additions: int = 0
+    deletions: int = 0
+    files_changed: int = 0
+    file_paths: List[str] = field(default_factory=list)
+
+    seconds_since_author_prev_commit: Optional[float] = None
+    edit_velocity: Optional[float] = None          # (additions+deletions) / seconds_since_prev
+    edit_velocity_flagged: bool = False            # above the chosen percentile
+    edit_velocity_excluded_reason: Optional[str] = None  # "squash_merge" / "mechanical_diff" / None
+
+    label: LabelSignal = field(default_factory=LabelSignal)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        return d
+
+
+# --------------------------------------------------------------------------
+# Pull-request-level
+# --------------------------------------------------------------------------
+
+@dataclass
+class PullRequestRecord:
+    repo_full_name: str
+    number: int
+    title: str = ""
+    body: Optional[str] = None
+    branch_name: Optional[str] = None
+    labels: List[str] = field(default_factory=list)
+    author_login: Optional[str] = None
+    created_at: Optional[str] = None
+    merged_at: Optional[str] = None
+    merge_commit_sha: Optional[str] = None
+    merged_via: Optional[str] = None       # "merge" / "squash" / "rebase"
+
+    additions: int = 0
+    deletions: int = 0
+    changed_files: int = 0
+    pr_size: int = 0                        # additions + deletions
+
+    review_comment_count: int = 0
+    review_depth: Optional[float] = None    # review_comment_count / pr_size
+    first_review_at: Optional[str] = None
+    review_latency_seconds: Optional[float] = None
+    rubber_stamp_flag: bool = False         # zero comments + fast approval
+
+    label: LabelSignal = field(default_factory=LabelSignal)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Feature vector (post explicit-signal stripping)
+# --------------------------------------------------------------------------
+
+@dataclass
+class CommitFeatureVector:
+    """Structural/statistical features only -- no label-source columns.
+
+    This is what actually gets handed to the classifier. Keeping it
+    separate from CommitRecord makes the "strip the signals before
+    training" step an explicit, auditable transformation rather than
+    an implicit convention someone can forget.
+    """
+    repo_full_name: str
+    sha: str
+
+    # message features
+    message_length: int = 0
+    message_line_count: int = 1
+    has_conventional_prefix: bool = False
+    template_likeness: float = 0.0
+
+    # timing features
+    seconds_since_prev_commit: Optional[float] = None
+    hour_of_day: Optional[int] = None
+    day_of_week: Optional[int] = None
+
+    # diff features
+    additions: int = 0
+    deletions: int = 0
+    files_changed: int = 0
+    add_delete_ratio: Optional[float] = None
+
+    # file-type mix
+    frac_source: float = 0.0
+    frac_docs: float = 0.0
+    frac_config: float = 0.0
+    frac_test: float = 0.0
+
+    # merge / edit velocity
+    is_merge: bool = False
+    merge_type: Optional[str] = None
+    edit_velocity: Optional[float] = None
+    edit_velocity_flagged: bool = False
+
+    # training target -- PU-learning framing: 1 = agent_labeled, 0 = unlabeled
+    # (never a ground-truth "0 = human"); kept here only for training/eval
+    # convenience and must be dropped for genuine inference on new data.
+    pu_label: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
