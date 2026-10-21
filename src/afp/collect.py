@@ -147,14 +147,17 @@ def clone_repo(clone_url: str, dest_dir: str, shallow_since: Optional[str] = Non
 
     try:
         _clone(args)
-    except GitCommandError:
-        if not shallow_since:
+    except GitCommandError as exc:
+        # only git's own "nothing after that date" answer means an empty
+        # window; any other failure (network, auth, timeout) must surface,
+        # or the repo would silently come back with one commit
+        if not shallow_since or "error processing shallow info" not in str(exc).lower():
             raise
         _clone(base + ["--depth", "1"])
     return str(dest)
 
 
-CLONE_ATTEMPTS = 3
+CLONE_ATTEMPTS = 4
 CLONE_RETRY_SECONDS = 10
 _NETWORK_ERRORS = ("unable to access", "could not resolve host", "failed to connect", "early eof",
                    "rpc failed", "timed out", "connection reset", "connection was reset",

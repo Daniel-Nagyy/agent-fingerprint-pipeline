@@ -240,6 +240,23 @@ def test_clone_retries_network_errors_then_falls_back_to_depth_1(monkeypatch, tm
     assert "--depth" in calls[-1] and "--no-checkout" in calls[-1]
 
 
+def test_clone_network_failure_is_raised_not_masked_by_depth_1(monkeypatch, tmp_path):
+    """Regression: persistent connection failures used to trigger the
+    empty-window fallback, so the repo came back with a single commit."""
+    from afp import collect
+    calls = []
+
+    def fake_git(args, cwd, timeout=120):
+        calls.append(args)
+        raise collect.GitCommandError("fatal: unable to access 'https://github.com/o/r.git/': "
+                                      "Failed to connect to github.com port 443 after 21079 ms")
+    monkeypatch.setattr(collect, "_run_git", fake_git)
+    monkeypatch.setattr(collect, "CLONE_RETRY_SECONDS", 0)
+    with pytest.raises(collect.GitCommandError, match="Failed to connect"):
+        collect.clone_repo("https://github.com/o/r.git", str(tmp_path / "r"), shallow_since="2026-02-22")
+    assert len(calls) == collect.CLONE_ATTEMPTS and all("--shallow-since" in c for c in calls)
+
+
 # --- end to end + batch ----------------------------------------------------
 
 @pytest.fixture
