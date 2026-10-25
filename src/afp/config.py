@@ -87,6 +87,11 @@ RUBBER_STAMP_MAX_LATENCY_SECONDS = 15 * 60  # "fast approval" -- 15 minutes; gro
 PR_PAGE_SIZE = 50             # PRs per GraphQL page (reviews nested)
 MAX_PRS_PER_REPO = 300        # newest PRs collected per repo; 0 = no cap
 LOC_MAX_FILE_BYTES = 2_000_000  # files larger than this are not line-counted
+# api mode has no file contents: LOC is estimated as code bytes / this.
+# Calibrated on the 185-repo corpus (Oct 2026): median 34.1 bytes per
+# counted line (IQR 29.9-39.5); 32 gives the best agreement with the exact
+# count on the 5,000-line rule, 172 of 177 repos (97%).
+BYTES_PER_LOC = 32.0
 
 # ---------------------------------------------------------------------------
 # Stack / language tagging

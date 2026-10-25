@@ -121,6 +121,8 @@ def test_graphql_record_normalises_bot_login_and_ignores_bot_reviews():
     assert rec.approval_latency_seconds == 600.0
     assert rec.rubber_stamp_flag is True                # 0 threads + approved in 10 min
     assert rec.ai_reviewers == ["CodeRabbit"]
+    # regression: a review bot reviewing is review adoption, not agent use on the PR
+    assert "coderabbit" not in rec.agent_commenter_brands
     assert rec.merged_via == "squash"
     assert rec.merge_commit_sha == "abc"
 

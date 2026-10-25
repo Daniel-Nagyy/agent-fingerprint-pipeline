@@ -211,6 +211,12 @@ def _is_code_path(path: str) -> bool:
     return ext in _CODE_EXTENSIONS
 
 
+def code_bytes(sizes: List[tuple]) -> int:
+    """Bytes of the files count_loc would count, from (path, size) pairs
+    -- available from a tree listing without reading any file."""
+    return sum(size for path, size in sizes if size <= config.LOC_MAX_FILE_BYTES and _is_code_path(path))
+
+
 def count_loc(repo_path: str, entries: Optional[List[TreeEntry]] = None) -> int:
     """Lines in HEAD's source and config files (docs excluded), read from
     the object store with one `git cat-file --batch` stream. Binary files
@@ -442,18 +448,27 @@ def collect_commits(repo_path: str, repo_full_name: str,
                     until: Optional[str] = None) -> List[CommitRecord]:
     """Parse `git log` into a list of CommitRecord (no edit velocity yet).
 
-    `since`/`until` (YYYY-MM-DD) bound the commit date, so a shallow
-    clone's boundary commit, or the single commit of a depth-1 fallback
-    clone, never leaks into the window."""
+    `since`/`until` (YYYY-MM-DD) bound the commit (committer) date, so a
+    depth clone's older commits, a shallow clone's boundary commit, or the
+    single commit of a depth-1 fallback clone never leak into the window.
+    The filter runs here rather than as `git log --since`, which stops
+    walking history at the first commit older than the date and so drops
+    in-window commits that sit behind an out-of-order date."""
     args = ["log", f"--pretty=format:{_LOG_FORMAT}", "--numstat"]
-    if since:
-        args.append(f"--since={since}T00:00:00Z")
-    if until:
-        args.append(f"--until={until}T23:59:59Z")
     if branch:
         args.append(branch)
     raw = _run_git(args, cwd=repo_path, timeout=900)
-    return _parse_log_output(raw, repo_full_name)
+    commits = _parse_log_output(raw, repo_full_name)
+    if not since and not until:
+        return commits
+    lo = datetime.fromisoformat(f"{since}T00:00:00+00:00") if since else None
+    hi = datetime.fromisoformat(f"{until}T23:59:59+00:00") if until else None
+
+    def _in_window(c: CommitRecord) -> bool:
+        dt = _parse_dt(c.commit_date or c.author_date)
+        return dt is not None and (lo is None or dt >= lo) and (hi is None or dt <= hi)
+
+    return [c for c in commits if _in_window(c)]
 
 
 def _is_mechanical_diff(commit: CommitRecord) -> bool:

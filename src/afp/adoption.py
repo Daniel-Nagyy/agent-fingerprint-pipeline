@@ -329,6 +329,8 @@ def merge_corpus(out_dir: str) -> Dict[str, Any]:
         "repos_ok": len(ok),
         "repos_failed": len(summaries) - len(ok),
         "repos_eligible": len(eligible),
+        "repos_eligible_unchecked": sum(1 for s in ok if (s.get("eligibility") or {}).get("eligible") is None
+                                        and s.get("eligibility")),
         "repos_with_any_agent": len(any_agent),
         "repos_with_primary_agent": sum(1 for s in ok if (s.get("adoption") or {}).get("primary_brands")),
         "repos_with_authoring_evidence": sum(1 for s in ok if (s.get("adoption") or {}).get("authoring_brands")),
@@ -346,7 +348,9 @@ def format_report(report: Dict[str, Any]) -> str:
     ok = report["repos_ok"] or 1
     lines = [
         f"Repos processed: {report['repos_ok']} ok, {report['repos_failed']} failed "
-        f"({report['repos_eligible']} meet every eligibility rule)",
+        f"({report['repos_eligible']} meet every eligibility rule"
+        + (f", {report['repos_eligible_unchecked']} pass the rules that could be checked"
+           if report.get("repos_eligible_unchecked") else "") + ")",
         f"Repos with any agent trace: {report['repos_with_any_agent']} "
         f"({100 * report['repos_with_any_agent'] / ok:.1f}%); "
         f"with one of the five primary brands: {report['repos_with_primary_agent']}; "

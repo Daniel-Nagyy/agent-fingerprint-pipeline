@@ -199,7 +199,7 @@ class FakeAPI(GitHubClient):
                                    "pushedAt": "2026-06-01T00:00:00Z", "createdAt": "2020-01-01T00:00:00Z",
                                    "primaryLanguage": {"name": "Python"}, "languages": {"edges": []},
                                    "defaultBranchRef": {"name": "main", "target": {"history": {"totalCount": 500}}}}}
-        if "history(first: 100" in query:
+        if "history(first: $n" in query:
             node = {"oid": "c1", "message": "Fix\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
                     "authoredDate": "2026-03-01T10:00:00Z", "committedDate": "2026-03-01T10:00:00Z",
                     "additions": 10, "deletions": 1, "changedFilesIfAvailable": 1,
@@ -217,7 +217,9 @@ class FakeAPI(GitHubClient):
         raise AssertionError(query[:80])
 
     def get_tree(self, owner, repo, ref):
-        return [{"path": "CLAUDE.md", "type": "blob"}, {"path": ".github/workflows/codex.yml", "type": "blob"}], False
+        return [{"path": "CLAUDE.md", "type": "blob", "size": 900},
+                {"path": "src/app.py", "type": "blob", "size": 320_000},
+                {"path": ".github/workflows/codex.yml", "type": "blob", "size": 60}], False
 
     def get_contributors_count(self, owner, repo):
         return 7
@@ -233,8 +235,36 @@ def test_run_pipeline_api_mode_end_to_end():
     assert result.adoption.commit_brand_counts == {"claude_code": 1}
     assert result.adoption.file_marker_brands == ["claude_code"]
     assert result.adoption.signal_brands == {"workflow": ["codex"]}
-    assert result.eligibility.eligible is True and result.eligibility.unchecked   # LOC unchecked, not failed
+    # LOC estimated from file sizes (320,060 code bytes / 32): passes, but flagged as not exactly checked
+    assert result.repo_metadata.loc_estimated and result.repo_metadata.total_loc == 10002
+    assert result.eligibility.eligible is None and result.eligibility.unchecked
     assert result.feature_vectors[0].edit_velocity is None   # first commit of its author
+
+
+def test_clone_mode_sizes_depth_from_api_count(monkeypatch):
+    """Regression: --shallow-since lost in-window commits behind merges of
+    old branches (46 of 185 corpus repos). With a token the clone is a
+    --depth clone sized from the API's commit count instead."""
+    from afp import pipeline
+
+    class CountingAPI(FakeAPI):
+        def graphql(self, query, variables=None):
+            if "history(since: $since) { totalCount }" in query:
+                return {"repository": {"defaultBranchRef": {"target": {"history": {"totalCount": 100}}}}}
+            return super().graphql(query, variables)
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_clone(url, dest, shallow_since=None, depth=None, timeout=900):
+        seen.update(shallow_since=shallow_since, depth=depth)
+        raise Stop()
+    monkeypatch.setattr(pipeline, "clone_repo", fake_clone)
+    with pytest.raises(Stop):
+        pipeline.run_pipeline("o", "r", mode="clone", client=CountingAPI(), shallow_since="2026-01-01")
+    assert seen == {"shallow_since": None, "depth": 120}
 
 
 # --- token pool -------------------------------------------------------------------
@@ -268,6 +298,27 @@ def test_token_pool_prefers_token_with_most_budget():
     client._remaining[(0, "core")] = 100
     client._remaining[(1, "core")] = 4000
     assert client._pick("core") == 1
+
+
+def test_graphql_page_halves_page_size_on_502():
+    """Regression: google/ExoPlayer's issue pages timed out (HTTP 502) five
+    times in a row at 50 issues per page and failed the repo."""
+    from afp.github_client import GitHubAPIError
+    client = GitHubClient(token="t")
+    sizes = []
+
+    def fake_graphql(query, variables=None):
+        sizes.append(variables["n"])
+        if variables["n"] > 12:
+            raise GitHubAPIError("Exceeded retries fetching https://api.github.com/graphql (HTTP 502)")
+        return {"ok": True}
+    client.graphql = fake_graphql
+    variables = {"n": 50}
+    assert client.graphql_page("q", variables) == {"ok": True}
+    assert sizes == [50, 25, 12] and variables["n"] == 12   # later pages keep the smaller size
+    client.graphql = MagicMock(side_effect=GitHubAPIError("GraphQL -> 401: bad credentials"))
+    with pytest.raises(GitHubAPIError, match="401"):
+        client.graphql_page("q", {"n": 50})                   # other errors are not retried
 
 
 def test_get_blobs_parses_aliases_and_skips_binaries():

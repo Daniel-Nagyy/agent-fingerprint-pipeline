@@ -8,24 +8,28 @@ corpus (for example a frozen [gitcorpus](https://github.com/Thabettt/gitcorpus)
 export) in parallel, resumably.
 
 1. **Repo eligibility + metadata**: stars, fork/archived, push recency,
-   lines of code (counted from the clone), full commit count, contributor
-   count, and "review required" on the default branch.
-2. **Commit collection** via `git clone` + `git log` (the approach
-   Robbes et al. use), bounded to a date window.
-3. **PR collection** via GraphQL: title/body/branch/labels, author,
-   merge method, reviews, review threads, AI reviewers.
-4. **Explicit-signal heuristics** for **29 named agent brands** (plus
-   `unknown`) across six
-   channels: commit trailers, agent-written message markers, bot
-   accounts, agent e-mail addresses, PR markers (branch prefix / label /
-   body), and repo file markers (`CLAUDE.md`, `.cursorrules`,
-   `.github/copilot-instructions.md`, ...). Labels follow the group's
-   source priority, and the output is always `agent_labeled` or
-   `unlabeled`, **never** `human`.
+   lines of code, full commit count, contributor count, and "review
+   required" on the default branch.
+2. **Commit collection** from a depth-limited `git clone` (the approach
+   Robbes et al. use) or, in `--mode api`, from GitHub's GraphQL history
+   with no clone at all.
+3. **PR and issue collection** via GraphQL: branch, labels, body, author,
+   merge method, reviews, AI reviewers, agent assignees, `@agent` mentions
+   and agent bot comments.
+4. **Detection of 70+ agent brands through every known channel** (the
+   full list is in [docs/agent-adoption-guide.pdf](docs/agent-adoption-guide.pdf)):
+   commit trailers and tool trailers, agent-written footers, author
+   identities and bot accounts, PR branches/labels/bodies, issue
+   assignments and mentions, rules/guidance files, CI workflows that run
+   agents, MCP config, agent dependencies and dev containers, agent
+   sub-folders, `.gitignore` entries and settings that hide agent use.
+   Commit labels follow the group's source priority, and the output is
+   always `agent_labeled` or `unlabeled`, **never** `human`.
 5. **Feature extraction**: message, timing, diff, file-type mix, merge
    type and edit velocity, with every label-source signal stripped
    *before* the features are computed.
-6. **Adoption roll-ups** per repo and per corpus.
+6. **Adoption roll-ups** per repo (brands by channel, adoption date,
+   hidden use) and per corpus.
 7. **Classifier baseline**: logistic regression / gradient boosting,
    repo-level train/test split, PU-learning-aware.
 
@@ -49,7 +53,14 @@ export GITHUB_TOKEN=github_pat_...     # PowerShell: $env:GITHUB_TOKEN = '...'
 
 A fine-grained token with **no scopes** is enough for public repos.
 Without a token the pipeline runs in git-only mode (commits, file markers,
-LOC and features; no PRs, stars, contributors or eligibility verdict).
+repo signals, LOC and features; no PRs, issues, stars, contributors or
+eligibility verdict).
+
+**Several tokens:** set `GITHUB_TOKENS=tok1,tok2,tok3` instead. Every
+request goes out on the token with the most budget left, and a
+rate-limited token is parked while the others keep working, so API
+throughput grows with the number of tokens (for example one per group
+member).
 
 ## Quick start
 
@@ -59,7 +70,10 @@ python -m afp.cli run spf13/viper --out ./out/viper --since 2026-02-22
 
 # A whole corpus: a gitcorpus corpus.csv (any CSV with a full_name column)
 # or a text file with one owner/repo per line
-python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --workers 8
+python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --workers 12
+
+# The fast way for many repos: no cloning, everything from the API
+python -m afp.cli batch corpus.csv --out ./out/corpus-api --since 2026-02-22 --mode api --workers 16
 
 # Pilot on the first 20 repos, then run the rest with the same command
 python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --limit 20
@@ -81,8 +95,12 @@ Window options (`run` and `batch`):
 | `--since YYYY-MM-DD` | First day of the window. The clone is shallow from this date, which keeps large repos cheap. |
 | `--until YYYY-MM-DD` | Last day of the window (commits and PRs). |
 | `--as-of YYYY-MM-DD` | Date the "pushed in the last 12 months" rule is measured from (default: today). |
+| `--mode clone\|api` | `clone` (default): every feature, exact LOC and file dates. `api`: no clone, about 4x faster; LOC estimated, no file-type-mix features. |
 | `--max-prs N` | Newest PRs per repo (default 300; `0` = every PR in the window). |
 | `--no-prs` | Skip PR collection. |
+| `--max-issues N` | Newest issues scanned per repo (default 200; `0` = all). |
+| `--no-issues` | Skip issue collection. |
+| `--max-commits N` | API mode: newest commits per repo (default 2000; `0` = all). |
 
 Batch-only: `--workers N` (parallel repos, default 4), `--retry-failed`,
 `--limit N`, `--keep-clones`, `--work-dir DIR`.
@@ -100,11 +118,19 @@ Batch-only: `--workers N` (parallel repos, default 4), `--retry-failed`,
   primary and secondary rate limits to reset (logged with `-v`).
 - **Disk stays small.** Clones are deleted as soon as a repo is done, so
   only about `--workers` clones exist at once.
-- **API cost per repo:** 1 GraphQL query for metadata, 1 GraphQL query per
-  50 PRs (each about 3 points), and 3 REST calls. With one token that is
-  roughly 1,500 repos/hour on the REST budget; in practice cloning is the
-  bottleneck. The 185-repo gitcorpus corpus took 10 minutes with 8
-  workers (see Testing).
+- **Two speeds.** On the 185-repo gitcorpus corpus (one token), `--mode api
+  --workers 16` took **3.6 minutes** (about 3,000 repos/hour, ~10 requests
+  per repo); `--mode clone --workers 12` took 12.2 minutes. Both found the
+  same 1,378 commits and the same agents. Use API mode to detect adoption
+  across many repos, and clone mode for the repos you train on.
+- **Parallel inside each repo.** In clone mode the API calls (metadata,
+  PRs, issues) run while the clone downloads.
+- **More tokens, more throughput.** With `GITHUB_TOKENS` the API budget is
+  the sum of all tokens (5,000 requests and 5,000 GraphQL points per hour
+  each).
+- **Heavy repos degrade gracefully.** When GitHub's GraphQL times out on a
+  page (HTTP 502/504, e.g. 50 issues with long threads), the page size is
+  halved and retried instead of failing the repo.
 - **No working tree.** Clones use `--no-checkout`: LOC and file markers
   are read from git's object store. Large repos used to spend most of
   their time writing (and, on Windows, virus-scanning) files only to
@@ -122,32 +148,61 @@ Per repo (`run --out DIR`, or `batch`'s `repos/<owner>__<repo>/`):
 |---|---|
 | `commits.jsonl` | One `CommitRecord` per commit in the window: raw data + full label evidence. |
 | `prs.jsonl` | One `PullRequestRecord` per PR (empty without a token or with `--no-prs`). |
+| `issues.jsonl` | One `IssueRecord` per issue with agent involvement: agent assignees, `@mentions`, agent bot comments. |
 | `features.jsonl` | One `CommitFeatureVector` per commit: what feeds the classifier. |
-| `file_markers.jsonl` | Agent configuration files present at HEAD, with the commit that first added each. |
+| `file_markers.jsonl` | Agent rules/guidance/config files present at HEAD, with the commit that first added each (clone mode). |
+| `signals.jsonl` | Other repo-level traces: CI workflows, MCP config, dependencies, dev containers, `.gitignore` entries, disabled attribution, agent sub-folders. |
 | `summary.json` | Status, mode, window, notes, repo metadata, eligibility, adoption roll-up. |
 
 Corpus level (`batch --out DIR`, rebuilt by `report`):
 
 | File | Contents |
 |---|---|
-| `repos.csv` | One row per repo: metadata, eligibility verdict + reasons, adoption (brands, agent commit/PR shares, first agent commit, AI reviewers). |
-| `adoption_by_brand.csv` | Repos / agent commits / agent PRs per brand, for all repos and for eligible repos only. |
+| `repos.csv` | One row per repo: metadata, eligibility (verdict, failed rules, unchecked rules), brands per channel, agent commit/PR shares, adoption date and its source, hidden use, AI reviewers. |
+| `adoption_by_brand.csv` | Per brand: kind, repos, repos found through each channel (commit, PR, file, workflow, MCP, agent folder, issue, hidden), agent commits and PRs, for all repos and eligible repos. |
 | `file_markers.csv` | Every agent config file found, with its first-added date. |
-| `commits.jsonl`, `prs.jsonl`, `features.jsonl` | All repos concatenated (`features.jsonl` is the training set). |
+| `signals.csv` | Every repo signal, with its strength (strong / medium / weak). |
+| `commits.jsonl`, `prs.jsonl`, `issues.jsonl`, `features.jsonl` | All repos concatenated (`features.jsonl` is the training set). |
 | `corpus_summary.json` | Headline numbers. |
 
 CSV files are UTF-8 with a BOM so Excel opens them correctly.
 
 ## Detection
 
-Signatures live in `src/afp/signatures.py`. The roster follows Robbes et
-al.'s validated heuristic set (file markers, commit trailers, branch
-names, PR labels), extended with the bot accounts, e-mail addresses and
-body markers the agents write themselves. The five methodology brands
-(`claude_code`, `copilot`, `codex`, `gemini`, `cursor`) are reported as
-`primary_brands`. Everything else (Aider, Devin, Jules, Junie, OpenHands,
-Windsurf, Cline, Amazon Q, ...) is still detected and reported, and generic
-traces (`AGENTS.md`, an `ai-generated` label) map to `unknown`.
+Signatures live in `src/afp/signatures.py`, repo-level checks in
+`src/afp/repo_scan.py`. The roster follows Robbes et al.'s validated
+heuristic set (file markers, commit trailers, branch names, PR labels),
+extended with every trace in [docs/agent-adoption-guide.pdf](docs/agent-adoption-guide.pdf),
+each confirmed against live GitHub searches in October 2026. Every brand
+has a **kind**: `primary` (the methodology's five: Claude Code, Copilot,
+Codex, Gemini, Cursor), `cloud` (Jules, Devin, Antigravity, Kiro, ...),
+`ide` (Aider, Amp, OpenCode, Warp, ...), `app_builder` (Lovable, Replit,
+v0, ...), `review` (CodeRabbit, Qodo, ...), `tooling` (Spec Kit,
+Taskmaster) and `generic` (`unknown`: `AGENTS.md`, an `ai-generated`
+label).
+
+| Channel | Examples | Strength |
+|---|---|---|
+| Commit trailer | `Co-Authored-By: Claude <noreply@anthropic.com>`, `Agent-Logs-Url:`, `Claude-Session:`, `Amp-Thread-ID:`, `Replit-Commit-Author: Agent`, `X-Lovable-Edit-ID:`, `Made-with: Cursor`, `Assisted-by: AGENT:MODEL` | strong |
+| Commit author | `Cursor Agent <cursoragent@cursor.com>`, `gpt-engineer-app[bot]`, `Jane Doe (aider)` | strong |
+| Message footer | `Generated with [Claude Code]`, `[Gemini CLI]`, `[OpenCode]`, `[Antigravity CLI]`, task/session links | strong |
+| PR | bot author, branch prefix (`codex/`, `cline/`, `Q-DEV-issue-`, `jules-<n>-<hash>` ...), label, body footer | strong |
+| CI workflow | `anthropics/claude-code-action`, `openai/codex-action`, `run-gemini-cli`, `copilot-setup-steps.yml` | strong |
+| Hidden attribution | `includeCoAuthoredBy: false`, aider `attribute-author: false`, "never add Co-authored-by" in guidance | strong |
+| Issue | agent assignee (`assignedActors`), agent bot comment | medium |
+| Files | `CLAUDE.md`, `.cursor/`, `.github/copilot-instructions.md`, `.kiro/`, ... | medium |
+| MCP / agent folders | `.mcp.json`, `.cursor/mcp.json`; `.claude/agents/`, `.github/prompts/` | medium |
+| Dev container | Claude Code feature, Cline/Roo/Continue extensions | medium / weak |
+| `.gitignore` | `CLAUDE.md`, `.aider*` (aider adds it itself) | medium; weak if template-like |
+| Dependency | `@anthropic-ai/claude-code`, `aider-chat` | weak |
+| `@mention` | `@claude`, `@codex`, `@copilot` in issues and PRs | weak unless the agent also acted |
+
+A brand counts as **adopted** by a repo when any channel shows it, except
+the weak ones (a dependency, a template-like `.gitignore`, a mention the
+agent never answered), which are still reported in their own columns.
+**AI review is kept apart**: a review bot reviewing or commenting on a PR
+goes to `ai_reviewers`, not to adoption. Only a commit it co-authored
+(an applied AI fix) labels a commit.
 
 **Every pattern is anchored** to where the agent writes it:
 
@@ -175,6 +230,25 @@ recorded per PR in `ai_reviewers`. They are review adoption, not
 authorship, and never label a PR or commit.
 
 ## Methodology notes and limitations
+
+- **Depth clones, not `--shallow-since`.** `git clone --shallow-since` cuts
+  the history at any commit that has a parent older than the date (a merge
+  of an old branch), silently dropping every in-window commit behind it.
+  On the 185-repo corpus it lost 219 of 1,378 commits (16%) across 46 repos.
+  With a token, clone mode asks the API how many commits lie between the
+  start date and HEAD and clones `--depth` that many plus a margin;
+  commits are then filtered by date in Python (not `git log --since`,
+  which also stops early at out-of-order dates). Without a token it falls
+  back to `--shallow-since` and says so in the notes.
+- **API mode** gets commits (with GitHub logins, additions, deletions and
+  files changed) from GraphQL history, so it sees exactly the same
+  commits as clone mode. It has no changed paths (the file-type-mix
+  features stay 0) and no file first-added dates. LOC is **estimated** as
+  code bytes / 32 (calibrated against the exact counts: the 5,000-line
+  rule agrees on 97% of repos); eligibility then reports the LOC rule as
+  unchecked and `eligible` is empty instead of true.
+- **Eligibility** is true, false, or empty when every rule that could be
+  checked passed but one could not (`eligibility_unchecked` says which).
 
 - **Lines of code** are counted from the clone: lines in tracked source
   and config files at HEAD (docs, binaries and files over 2 MB excluded).
@@ -248,7 +322,7 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-119 tests. They cover:
+176 tests. They cover:
 
 - the signature roster, with real true and false positives;
 - label priority and PR propagation;
@@ -261,7 +335,10 @@ pytest -q
   (mocked);
 - merge-method inference;
 - an end-to-end git-only run;
-- batch resume and failure isolation.
+- batch resume and failure isolation;
+- every trace family in the adoption guide (real true and false
+  positives), repo signals, issues and mentions, review-bot separation;
+- API mode end to end, depth sizing, the token pool, page-size halving.
 
 Live checks run against the real API:
 
@@ -278,3 +355,11 @@ Live checks run against the real API:
   "Generated with [Claude Code]" footer or a `claude/` branch. Window
   commit counts for the repos that had disagreed between test runs now
   match `git rev-list` exactly.
+- After the full extension (Oct 2026): both modes on the same corpus found
+  1,378 commits, 1,126 PRs and 21 repos with agent use (Claude Code 11,
+  Copilot 6, Codex 3, Cursor, Junie, Jules, Aider 1 each; 18 with
+  agent-written commits or PRs; 1 with hidden use). Clone mode before the
+  depth fix had found only 1,159 commits. Every newly found brand was
+  checked by hand; review-only bots (Gemini Code Assist, CodeRabbit on
+  dependabot PRs) were first counted as adoption, which led to keeping AI
+  review apart.

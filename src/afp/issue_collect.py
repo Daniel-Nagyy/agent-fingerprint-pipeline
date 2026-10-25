@@ -84,9 +84,9 @@ def collect_issues(client: GitHubClient, owner: str, repo: str, since: Optional[
     until_dt = _parse_dt(f"{until}T23:59:59Z") if until else None
     found: List[IssueRecord] = []
     seen = 0
-    cursor = None
+    variables = {"owner": owner, "name": repo, "cursor": None, "n": page_size}
     while True:
-        data = client.graphql(ISSUE_PAGE_QUERY, {"owner": owner, "name": repo, "cursor": cursor, "n": page_size})
+        data = client.graphql_page(ISSUE_PAGE_QUERY, variables)
         repo_data = data.get("repository")
         if repo_data is None:
             break
@@ -110,5 +110,5 @@ def collect_issues(client: GitHubClient, owner: str, repo: str, since: Optional[
                 break
         if stop or not conn["pageInfo"]["hasNextPage"]:
             break
-        cursor = conn["pageInfo"]["endCursor"]
+        variables["cursor"] = conn["pageInfo"]["endCursor"]
     return found

@@ -323,6 +323,23 @@ class GitHubClient:
         resp = self._get("/rate_limit")
         return resp.json() if resp.status_code == 200 else {}
 
+    def graphql_page(self, query: str, variables: Dict[str, Any], size_var: str = "n",
+                     min_size: int = 5) -> Dict[str, Any]:
+        """graphql() for one page of a paged query, halving the page size
+        while GitHub answers 502/504. GraphQL gives up on queries that run
+        too long (a 50-issue page with 20 comments each on a huge repo);
+        a smaller page then succeeds. The size used is left in
+        `variables[size_var]` so later pages keep it."""
+        while True:
+            try:
+                return self.graphql(query, variables)
+            except GitHubAPIError as exc:
+                size = variables.get(size_var) or 0
+                if not any(code in str(exc) for code in ("502", "504")) or size <= min_size:
+                    raise
+                variables[size_var] = max(min_size, size // 2)
+                log.info("GraphQL timed out; retrying with page size %d", variables[size_var])
+
     # -- API-only mode helpers -------------------------------------------
 
     def get_tree(self, owner: str, repo: str, ref: str) -> Tuple[List[Dict[str, Any]], bool]:

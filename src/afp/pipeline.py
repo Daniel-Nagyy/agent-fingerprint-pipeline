@@ -31,7 +31,8 @@ from typing import Any, Dict, List, Optional
 
 from . import repo_scan
 from .adoption import summarize_repo
-from .collect import (clone_repo, collect_commits, compute_edit_velocity, count_commits, count_loc,
+from . import config
+from .collect import (clone_repo, code_bytes, collect_commits, compute_edit_velocity, count_commits, count_loc,
                       find_file_markers, first_added, head_tree, is_shallow, read_blobs, remove_tree)
 from .features import commits_to_feature_vectors
 from .heuristics import apply_pr_label
@@ -157,16 +158,33 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
         tmp_ctx = tempfile.TemporaryDirectory(prefix="afp_")
         work_dir = tmp_ctx.name
     clone_path = str(Path(work_dir) / f"{owner}__{repo}")
-    total_loc = git_commit_count = None
+    total_loc = git_commit_count = n_code_bytes = None
+    loc_estimated = False
 
     try:
         if mode == "clone":
             # --- 1. clone + commits + files (no token needed) -------------
-            clone_repo(f"https://github.com/{owner}/{repo}.git", clone_path, shallow_since=shallow_since)
+            depth = None
+            if client is not None and shallow_since:
+                # size a --depth clone from the API: --shallow-since cuts the
+                # graph at any merge with an old parent and loses commits
+                from .api_collect import commits_since_count
+                try:
+                    n = commits_since_count(client, owner, repo, shallow_since)
+                except Exception:
+                    n = None
+                if n is not None:
+                    depth = n + max(20, n // 5)
+            if depth is None and shallow_since:
+                result.notes.append("no token: cloned with --shallow-since, which can miss in-window commits "
+                                    "behind a merge of an old branch")
+            clone_repo(f"https://github.com/{owner}/{repo}.git", clone_path,
+                       shallow_since=None if depth else shallow_since, depth=depth)
             commits = collect_commits(clone_path, full_name, branch=branch, since=shallow_since, until=until)
             tree = head_tree(clone_path)
             paths = [e.path for e in tree]
             total_loc = count_loc(clone_path, tree)
+            n_code_bytes = code_bytes([(e.path, e.size) for e in tree])
             result.file_markers = find_file_markers(clone_path, paths)
             git_commit_count = None if is_shallow(clone_path) else count_commits(clone_path)
             texts = read_blobs(clone_path, repo_scan.wanted_paths(paths))
@@ -182,10 +200,13 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
             if truncated:
                 result.notes.append("file tree truncated by GitHub (very large repo); some files may be missed")
             result.file_markers = _markers_from_paths(paths)
+            n_code_bytes = code_bytes([(e["path"], e.get("size") or 0) for e in entries])
+            if not truncated:
+                total_loc, loc_estimated = round(n_code_bytes / config.BYTES_PER_LOC), True
             texts = client.get_blobs(owner, repo, repo_scan.wanted_paths(paths))
             result.signals = repo_scan.scan(paths, texts.get)
-            result.notes.append("api mode: no clone, so LOC, changed paths (file-type mix) and "
-                                "file first-added dates are not available")
+            result.notes.append("api mode: no clone, so LOC is estimated from file sizes, and changed "
+                                "paths (file-type mix) and file first-added dates are not available")
         result.commits = commits
         meta = RepoMetadata(owner=owner, name=repo, full_name=full_name, total_loc=total_loc,
                             commit_count=git_commit_count,
@@ -198,6 +219,7 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
                 from .eligibility import _size_tier, check_eligibility
                 meta = futures["meta"].result()
                 meta.total_loc = total_loc
+                meta.code_bytes, meta.loc_estimated = n_code_bytes, loc_estimated
                 meta.size_tier = _size_tier(total_loc)
                 if meta.commit_count is None and git_commit_count is not None:
                     meta.commit_count, meta.commit_count_source = git_commit_count, "git"

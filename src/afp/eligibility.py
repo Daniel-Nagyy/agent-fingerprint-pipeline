@@ -145,9 +145,12 @@ def check_eligibility(meta: RepoMetadata, commit_count: Optional[int] = None,
     elif effective_commit_count is None:
         unchecked.append("commit_count (unknown)")
 
+    if getattr(meta, "loc_estimated", False) and meta.total_loc is not None:
+        unchecked.append(f"total_loc estimated from file sizes (~{meta.total_loc} lines)")
+
     return EligibilityResult(
         full_name=meta.full_name,
-        eligible=(len(reasons) == 0),
+        eligible=False if reasons else (None if unchecked else True),
         reasons=reasons,
         unchecked=unchecked,
         checked_at=now.isoformat(),

@@ -249,8 +249,12 @@ def record_from_graphql(owner: str, repo: str, node: Dict[str, Any]) -> PullRequ
             if brand not in record.mention_brands:
                 record.mention_brands.append(brand)
     for login in commenters + [r["_login"] for r in reviews]:
+        # AI review bots reviewing a PR are review adoption (ai_reviewers),
+        # not use of a coding agent on the PR
+        if not login or login.lower() in sig_db.REVIEW_BOT_LOGINS:
+            continue
         brand = sig_db.brand_for_login(login)
-        if brand and login and login.lower() != (record.author_login or "").lower() \
+        if brand and login.lower() != (record.author_login or "").lower() \
                 and brand not in record.agent_commenter_brands:
             record.agent_commenter_brands.append(brand)
     return _finish_record(record, reviews, [r["_login"] for r in reviews] + commenters)
@@ -267,9 +271,9 @@ def collect_pull_requests(client: GitHubClient, owner: str, repo: str,
     since_dt = _parse_dt(f"{since}T00:00:00Z") if since else None
     until_dt = _parse_dt(f"{until}T23:59:59Z") if until else None
     records: List[PullRequestRecord] = []
-    cursor = None
+    variables = {"owner": owner, "name": repo, "cursor": None, "n": page_size}
     while True:
-        data = client.graphql(PR_PAGE_QUERY, {"owner": owner, "name": repo, "cursor": cursor, "n": page_size})
+        data = client.graphql_page(PR_PAGE_QUERY, variables)
         repo_data = data.get("repository")
         if repo_data is None:
             break
@@ -290,5 +294,5 @@ def collect_pull_requests(client: GitHubClient, owner: str, repo: str,
                 break
         if stop or not conn["pageInfo"]["hasNextPage"]:
             break
-        cursor = conn["pageInfo"]["endCursor"]
+        variables["cursor"] = conn["pageInfo"]["endCursor"]
     return records

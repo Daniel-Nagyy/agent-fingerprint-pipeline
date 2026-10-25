@@ -20,10 +20,10 @@ from .heuristics import resolve_label
 from .schema import CommitRecord
 
 HISTORY_QUERY = """
-query($owner: String!, $name: String!, $cursor: String, $since: GitTimestamp, $until: GitTimestamp) {
+query($owner: String!, $name: String!, $cursor: String, $since: GitTimestamp, $until: GitTimestamp, $n: Int!) {
   repository(owner: $owner, name: $name) {
     defaultBranchRef { target { ... on Commit {
-      history(first: 100, after: $cursor, since: $since, until: $until) {
+      history(first: $n, after: $cursor, since: $since, until: $until) {
         pageInfo { hasNextPage endCursor }
         nodes {
           oid message authoredDate committedDate additions deletions changedFilesIfAvailable
@@ -36,6 +36,26 @@ query($owner: String!, $name: String!, $cursor: String, $since: GitTimestamp, $u
   }
 }
 """
+
+
+COUNT_QUERY = """
+query($owner: String!, $name: String!, $since: GitTimestamp) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { target { ... on Commit { history(since: $since) { totalCount } } } }
+  }
+}
+"""
+
+
+def commits_since_count(client: GitHubClient, owner: str, repo: str, since: str) -> Optional[int]:
+    """Number of default-branch commits from `since` to HEAD. Clone mode
+    uses it to size a `--depth` clone: `--shallow-since` cuts the graph at
+    any commit with a parent older than the date (a merge of an old
+    branch), silently dropping the in-window commits behind it."""
+    data = client.graphql(COUNT_QUERY, {"owner": owner, "name": repo, "since": f"{since}T00:00:00Z"})
+    target = (((data.get("repository") or {}).get("defaultBranchRef") or {}).get("target") or {})
+    history = target.get("history")
+    return history.get("totalCount") if history else None
 
 
 def commit_from_node(full_name: str, node: dict) -> CommitRecord:
@@ -79,10 +99,10 @@ def collect_commits_api(client: GitHubClient, owner: str, repo: str, since: Opti
     full_name = f"{owner}/{repo}"
     variables = {"owner": owner, "name": repo, "cursor": None,
                  "since": f"{since}T00:00:00Z" if since else None,
-                 "until": f"{until}T23:59:59Z" if until else None}
+                 "until": f"{until}T23:59:59Z" if until else None, "n": 100}
     commits: List[CommitRecord] = []
     while True:
-        data = client.graphql(HISTORY_QUERY, variables)
+        data = client.graphql_page(HISTORY_QUERY, variables)
         target = (((data.get("repository") or {}).get("defaultBranchRef") or {}).get("target") or {})
         history = target.get("history")
         if not history:

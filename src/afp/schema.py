@@ -34,6 +34,8 @@ class RepoMetadata:
     languages: Dict[str, int] = field(default_factory=dict)   # bytes per language
     total_loc: Optional[int] = None          # lines in source/config files at the clone's HEAD
     language_bytes: Optional[int] = None     # sum of the languages API byte counts
+    code_bytes: Optional[int] = None         # bytes of the source/config files counted for LOC
+    loc_estimated: bool = False              # total_loc estimated from code_bytes (api mode)
     commit_count: Optional[int] = None       # full default-branch history, not just the window
     commit_count_source: Optional[str] = None  # "graphql" / "git" / None
     contributor_count: Optional[int] = None
@@ -51,7 +53,7 @@ class RepoMetadata:
 @dataclass
 class EligibilityResult:
     full_name: str
-    eligible: bool
+    eligible: Optional[bool]   # None = passed every rule that could be checked, some unchecked
     reasons: List[str] = field(default_factory=list)  # failed-check explanations
     unchecked: List[str] = field(default_factory=list)  # rules that could not be checked (e.g. LOC in API mode)
     checked_at: Optional[str] = None
