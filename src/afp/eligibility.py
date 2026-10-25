@@ -133,20 +133,22 @@ def check_eligibility(meta: RepoMetadata, commit_count: Optional[int] = None,
     if meta.stars < config.MIN_STARS:
         reasons.append(f"stars {meta.stars} < minimum {config.MIN_STARS}")
 
+    unchecked = []
     if meta.total_loc is not None and meta.total_loc < config.MIN_LOC:
         reasons.append(f"total_loc {meta.total_loc} < minimum {config.MIN_LOC}")
     elif meta.total_loc is None:
-        reasons.append("total_loc unknown (no clone)")
+        unchecked.append("total_loc (not counted without a clone)")
 
     effective_commit_count = commit_count if commit_count is not None else meta.commit_count
     if effective_commit_count is not None and effective_commit_count < config.MIN_COMMITS:
         reasons.append(f"commit_count {effective_commit_count} < minimum {config.MIN_COMMITS}")
     elif effective_commit_count is None:
-        reasons.append("commit_count unknown (not yet collected)")
+        unchecked.append("commit_count (unknown)")
 
     return EligibilityResult(
         full_name=meta.full_name,
         eligible=(len(reasons) == 0),
         reasons=reasons,
+        unchecked=unchecked,
         checked_at=now.isoformat(),
     )

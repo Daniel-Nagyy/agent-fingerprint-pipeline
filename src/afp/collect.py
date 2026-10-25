@@ -258,6 +258,45 @@ def count_loc(repo_path: str, entries: Optional[List[TreeEntry]] = None) -> int:
     return total
 
 
+def read_blobs(repo_path: str, paths: List[str], max_bytes: int = 300_000) -> dict:
+    """Text of HEAD:<path> for each path (one `git cat-file --batch`
+    call; works on a --no-checkout clone). Missing, binary or oversized
+    files are left out."""
+    if not paths:
+        return {}
+    request = "".join(f"HEAD:{p}\n" for p in paths).encode("utf-8")
+    proc = subprocess.run(["git", "cat-file", "--batch"], cwd=repo_path, input=request,
+                          capture_output=True, timeout=120, env={**os.environ, **_GIT_ENV})
+    out, pos, texts = proc.stdout, 0, {}
+    for path in paths:
+        nl = out.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = out[pos:nl].split()
+        pos = nl + 1
+        if len(header) < 3 or header[-1] == b"missing":
+            continue
+        size = int(header[2])
+        data = out[pos:pos + size]
+        pos += size + 1
+        if header[1] == b"blob" and size <= max_bytes and b"\0" not in data[:8192]:
+            texts[path] = data.decode("utf-8", errors="replace")
+    return texts
+
+
+def first_added(repo_path: str, path: str) -> tuple:
+    """(sha, author date) of the earliest collected commit adding `path`."""
+    try:
+        out = _run_git(["log", "--diff-filter=A", f"--format=%H{_FIELD_SEP}%aI", "--", path],
+                       cwd=repo_path, timeout=120).strip().splitlines()
+    except GitCommandError:
+        return None, None
+    if not out:
+        return None, None
+    sha, date = out[-1].split(_FIELD_SEP, 1)
+    return sha, date
+
+
 def find_file_markers(repo_path: str, files: Optional[List[str]] = None,
                       max_markers: int = 50) -> List[FileMarker]:
     """Agent configuration files present at HEAD (CLAUDE.md, .cursorrules,
@@ -391,6 +430,8 @@ def _parse_log_output(raw: str, repo_full_name: str) -> List[CommitRecord]:
             author_login=None,   # git log has no logins; noreply addresses are resolved via the e-mail
             author_email=ae,
             committer_email=ce,
+            author_name=an,
+            committer_name=cn,
         )
         commits.append(commit)
     return commits

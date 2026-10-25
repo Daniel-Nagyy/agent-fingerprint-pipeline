@@ -38,6 +38,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         collect_prs=not args.no_prs,
         max_prs=args.max_prs,
         as_of=args.as_of,
+        mode=args.mode,
+        collect_issues=not args.no_issues,
+        max_issues=args.max_issues,
+        max_commits=args.max_commits,
     )
     paths = export_jsonl(result, args.out)
     print(f"Mode: {result.mode}")
@@ -69,7 +73,8 @@ def _cmd_batch(args: argparse.Namespace) -> int:
         run_batch(repos, args.out, workers=args.workers, since=args.since, until=args.until,
                   collect_prs=not args.no_prs, max_prs=args.max_prs, retry_failed=args.retry_failed,
                   keep_clones=args.keep_clones, work_dir=args.work_dir, limit=args.limit,
-                  as_of=args.as_of)
+                  as_of=args.as_of, mode=args.mode, collect_issues=not args.no_issues,
+                  max_issues=args.max_issues, max_commits=args.max_commits)
     except KeyboardInterrupt:
         print("Interrupted. Re-run the same command to resume.", file=sys.stderr)
         return 130
@@ -133,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-prs", action="store_true", help="skip PR-level collection even if a token is set")
         p.add_argument("--max-prs", type=int, default=None,
                        help="newest PRs collected per repo (default 300; 0 = all in the window)")
+        p.add_argument("--mode", choices=("clone", "api"), default="clone",
+                       help="clone: full features from a shallow clone (default); api: no clone, "
+                            "commits/files/PRs/issues from the GitHub API -- much faster, no LOC or file-type mix")
+        p.add_argument("--no-issues", action="store_true", help="skip issue collection (assignments, @mentions)")
+        p.add_argument("--max-issues", type=int, default=200, help="newest issues scanned per repo (0 = all in the window)")
+        p.add_argument("--max-commits", type=int, default=2000, help="api mode: newest commits per repo (0 = all)")
         p.add_argument("--as-of", type=_date, default=None,
                        help="date the 12-month push-recency rule is measured from (default today)")
 

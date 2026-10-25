@@ -53,6 +53,7 @@ class EligibilityResult:
     full_name: str
     eligible: bool
     reasons: List[str] = field(default_factory=list)  # failed-check explanations
+    unchecked: List[str] = field(default_factory=list)  # rules that could not be checked (e.g. LOC in API mode)
     checked_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -156,6 +157,8 @@ class PullRequestRecord:
     approval_latency_seconds: Optional[float] = None
     rubber_stamp_flag: bool = False         # zero comments + fast approval
     ai_reviewers: List[str] = field(default_factory=list)  # AI review bots that reviewed or commented
+    mention_brands: List[str] = field(default_factory=list)          # agents @mentioned in body/comments
+    agent_commenter_brands: List[str] = field(default_factory=list)  # agent bots that commented
 
     label: LabelSignal = field(default_factory=LabelSignal)
 
@@ -234,6 +237,41 @@ class FileMarker:
 
 
 @dataclass
+class RepoSignal:
+    """A repo-level adoption trace that is not a rules/guidance file: a CI
+    workflow running an agent, MCP config, an agent dependency or dev
+    container feature, a .gitignore entry hiding agent files, a setting
+    that switches commit attribution off, or an agent sub-folder
+    (sub-agents, commands, skills, prompts)."""
+    kind: str            # workflow / mcp / dependency / devcontainer / gitignore / hidden_attribution / agent_dir
+    brand: str
+    path: str
+    detail: str = ""
+    strength: str = "medium"   # strong / medium / weak
+    first_added_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class IssueRecord:
+    """An issue's agent involvement: who it was assigned to, which agents
+    were @mentioned, and which agent bots commented."""
+    repo_full_name: str
+    number: int
+    created_at: Optional[str] = None
+    author_login: Optional[str] = None
+    author_brand: Optional[str] = None
+    assignee_brands: List[str] = field(default_factory=list)
+    mention_brands: List[str] = field(default_factory=list)
+    agent_commenter_brands: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class RepoAdoption:
     """One row per repo: which agents left traces, through which source,
     and how much of the collected window they account for."""
@@ -247,12 +285,18 @@ class RepoAdoption:
     agent_pr_share: Optional[float] = None
     brands: List[str] = field(default_factory=list)          # every brand seen anywhere
     primary_brands: List[str] = field(default_factory=list)  # restricted to the methodology's five
+    authoring_brands: List[str] = field(default_factory=list)  # brands with commit/PR authorship evidence
     commit_brand_counts: Dict[str, int] = field(default_factory=dict)
     pr_brand_counts: Dict[str, int] = field(default_factory=dict)
     file_marker_brands: List[str] = field(default_factory=list)
+    signal_brands: Dict[str, List[str]] = field(default_factory=dict)  # signal kind -> brands
+    issue_brands: Dict[str, List[str]] = field(default_factory=dict)   # assigned / mentioned / commented -> brands
     label_source_counts: Dict[str, int] = field(default_factory=dict)
     first_agent_commit_at: Optional[str] = None
+    adoption_date: Optional[str] = None          # earliest commit, PR, file or workflow evidence
+    adoption_date_source: Optional[str] = None
     ai_reviewers: List[str] = field(default_factory=list)
+    hidden_use: bool = False     # agent files ignored or attribution switched off
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

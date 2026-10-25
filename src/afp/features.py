@@ -56,6 +56,11 @@ def _parse_dt(s: Optional[str]) -> Optional[datetime]:
 
 
 _ROBOT_LINE_RE = re.compile(r"^\s*\U0001F916\s*generated (?:with|by)\b.*$", re.IGNORECASE)
+# every line of the tool trailer families, including the ones that are not
+# a label on their own (Replit writes Replit-Commit-* on human commits too)
+_TOOL_TRAILER_LINE_RE = re.compile(
+    r"^\s*(?:agent-logs-url|claude-session|amp-thread-id|replit-commit-[\w-]+|x-lovable-[\w-]+|made-with)\s*:",
+    re.IGNORECASE)
 
 
 def strip_label_signals(message: str) -> str:
@@ -68,7 +73,8 @@ def strip_label_signals(message: str) -> str:
         m = sig_db.TRAILER_RE.match(line)
         if m and _trailer_brand(m.group("name") or "", m.group("email") or ""):
             continue
-        if _ROBOT_LINE_RE.match(line) or any(p.search(line) for _, p in sig_db.BODY_MARKER_PATTERNS):
+        if _ROBOT_LINE_RE.match(line) or _TOOL_TRAILER_LINE_RE.match(line) \
+                or any(p.search(line) for _, p in sig_db.BODY_MARKER_PATTERNS):
             continue
         if i == 0:
             for _, p in sig_db.SUBJECT_PREFIX_PATTERNS:

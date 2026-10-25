@@ -110,12 +110,14 @@ def _one_line(result: PipelineResult) -> str:
         parts = []
         for b in ad.brands:
             n = ad.commit_brand_counts.get(b, 0) + ad.pr_brand_counts.get(b, 0)
-            parts.append(f"{b} ({n})" if n else f"{b} (file)")
+            parts.append(f"{b} ({n})" if n else f"{b} (repo)")
         agents = "; agents: " + ", ".join(parts)
+        if ad.hidden_use:
+            agents += " [hidden use]"
     elig = ""
     if result.eligibility is not None:
         elig = "; eligible" if result.eligibility.eligible else "; not eligible"
-    return (f"{len(result.commits)} commits, {len(result.pull_requests)} PRs"
+    return (f"{len(result.commits)} commits, {len(result.pull_requests)} PRs, {len(result.issues)} agent issues"
             f"{elig}{agents}")
 
 
@@ -124,7 +126,8 @@ def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
               collect_prs: bool = True, max_prs: Optional[int] = None,
               retry_failed: bool = False, keep_clones: bool = False,
               work_dir: Optional[str] = None, limit: Optional[int] = None,
-              as_of: Optional[str] = None) -> Dict:
+              as_of: Optional[str] = None, mode: str = "clone", collect_issues: bool = True,
+              max_issues: int = 200, max_commits: int = 2000) -> Dict:
     out = Path(out_dir)
     (out / "repos").mkdir(parents=True, exist_ok=True)
     work = Path(work_dir) if work_dir else out / "_clones"
@@ -144,17 +147,19 @@ def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
         todo = todo[:limit]
 
     with open(out / "run_config.json", "w", encoding="utf-8") as f:
-        json.dump({"since": since, "until": until, "as_of": as_of, "collect_prs": collect_prs, "max_prs": max_prs,
+        json.dump({"mode": mode, "since": since, "until": until, "as_of": as_of, "collect_prs": collect_prs,
+                   "max_prs": max_prs, "collect_issues": collect_issues, "max_issues": max_issues,
                    "workers": workers, "repos_in_list": len(repos),
                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f, indent=2)
 
-    client = None
-    if os.environ.get("GITHUB_TOKEN"):
-        from .github_client import GitHubClient
-        client = GitHubClient()
-    mode = "full" if client else "git-only (GITHUB_TOKEN not set)"
+    from .github_client import GitHubClient, tokens_from_env
+    tokens = tokens_from_env()
+    client = GitHubClient(tokens=tokens) if tokens else None
+    if mode == "api" and client is None:
+        raise ValueError("--mode api needs GITHUB_TOKEN or GITHUB_TOKENS")
+    label = (f"{mode}, {len(tokens)} token(s)" if client else "git-only (GITHUB_TOKEN not set)")
     print(f"{len(repos)} repos in list: {skipped_done} already done, {skipped_failed} failed earlier "
-          f"(use --retry-failed to retry), {len(todo)} to run with {workers} worker(s), mode {mode}",
+          f"(use --retry-failed to retry), {len(todo)} to run with {workers} worker(s), mode {label}",
           flush=True)
 
     window = {"since": since, "until": until}
@@ -163,7 +168,8 @@ def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
         owner, repo = name.split("/", 1)
         result = run_pipeline(owner, repo, work_dir=str(work), shallow_since=since, until=until,
                               collect_prs=collect_prs, keep_clone=keep_clones, client=client,
-                              max_prs=max_prs, as_of=as_of)
+                              max_prs=max_prs, as_of=as_of, mode=mode, collect_issues=collect_issues,
+                              max_issues=max_issues, max_commits=max_commits)
         export_jsonl(result, str(repo_dir(out_dir, name)))
         return result
 

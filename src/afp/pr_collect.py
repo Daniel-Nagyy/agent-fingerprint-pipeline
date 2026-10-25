@@ -207,7 +207,7 @@ query($owner: String!, $name: String!, $cursor: String, $n: Int!) {
         reviews(first: 30) {
           nodes { state submittedAt author { login __typename } }
         }
-        comments(first: 20) { nodes { author { login __typename } } }
+        comments(first: 20) { nodes { body author { login __typename } } }
       }
     }
   }
@@ -220,7 +220,8 @@ def record_from_graphql(owner: str, repo: str, node: Dict[str, Any]) -> PullRequ
     for r in (node.get("reviews") or {}).get("nodes") or []:
         reviews.append({"_login": _normalise_login(r.get("author")), "state": r.get("state"),
                         "submittedAt": r.get("submittedAt")})
-    commenters = [_normalise_login(c.get("author")) for c in (node.get("comments") or {}).get("nodes") or []]
+    comments = (node.get("comments") or {}).get("nodes") or []
+    commenters = [_normalise_login(c.get("author")) for c in comments]
     merge_commit = node.get("mergeCommit")
     commit_count = (node.get("commits") or {}).get("totalCount")
     record = PullRequestRecord(
@@ -243,6 +244,15 @@ def record_from_graphql(owner: str, repo: str, node: Dict[str, Any]) -> PullRequ
         # stand-in for REST's review-comment count
         review_comment_count=(node.get("reviewThreads") or {}).get("totalCount") or 0,
     )
+    for text in [node.get("body")] + [c.get("body") for c in comments]:
+        for brand in sig_db.mentioned_brands(text):
+            if brand not in record.mention_brands:
+                record.mention_brands.append(brand)
+    for login in commenters + [r["_login"] for r in reviews]:
+        brand = sig_db.brand_for_login(login)
+        if brand and login and login.lower() != (record.author_login or "").lower() \
+                and brand not in record.agent_commenter_brands:
+            record.agent_commenter_brands.append(brand)
     return _finish_record(record, reviews, [r["_login"] for r in reviews] + commenters)
 
 

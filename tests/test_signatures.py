@@ -85,10 +85,19 @@ def test_agent_bot_logins(login, brand):
     assert sig.label == AGENT and sig.agent_brand == brand
 
 
-def test_ci_and_review_bots_are_bots_but_not_agents():
-    for login in ("dependabot[bot]", "renovate[bot]", "coderabbitai[bot]"):
+def test_ci_bots_are_bots_but_not_agents():
+    for login in ("dependabot[bot]", "renovate[bot]", "github-actions[bot]"):
         sig = detect_bot_account(login)
         assert sig.is_bot_account and sig.label == UNLABELED
+
+
+def test_review_bots_are_review_kind_agents():
+    """A commit co-authored by a review bot applied its AI fix: labelled,
+    but kept apart from authoring agents by its kind."""
+    from afp.signatures import BRAND_KIND
+    sig = detect_bot_account("coderabbitai[bot]")
+    assert sig.label == AGENT and sig.agent_brand == "coderabbit"
+    assert BRAND_KIND["coderabbit"] == "review"
 
 
 def test_noreply_email_resolves_login():

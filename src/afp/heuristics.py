@@ -28,10 +28,10 @@ from .schema import LabelSignal
 
 
 def _trailer_brand(name: str, email: str) -> Optional[str]:
-    brand = sig_db.brand_for_email(email)
+    name = name.strip()
+    brand = sig_db.brand_for_email(email, name)
     if brand:
         return brand
-    name = name.strip()
     for brand, pattern in sig_db.TRAILER_NAME_PATTERNS:
         if pattern.search(name):
             return brand
@@ -40,7 +40,10 @@ def _trailer_brand(name: str, email: str) -> Optional[str]:
 
 def detect_trailer(commit_message: str) -> LabelSignal:
     """Look for a Co-authored-by / Generated-by / Assisted-by trailer
-    naming a known agent by exact address or anchored name."""
+    naming a known agent by exact address or anchored name, then for the
+    trailers a tool writes on its own (Agent-Logs-Url, Claude-Session,
+    Amp-Thread-ID, Replit-Commit-Author: Agent, X-Lovable-Edit-ID,
+    Made-with: Cursor)."""
     sig = LabelSignal()
     if not commit_message:
         return sig
@@ -58,6 +61,15 @@ def detect_trailer(commit_message: str) -> LabelSignal:
         if not sig.has_trailer:
             sig.has_trailer = True
             sig.trailer_text = m.group(0).strip()
+    for pattern, brand in sig_db.TOOL_TRAILERS:
+        m = pattern.search(commit_message)
+        if m:
+            sig.has_trailer = True
+            sig.trailer_text = m.group(0).strip()
+            sig.agent_brand = brand
+            sig.label_source = "trailer"
+            sig.label = config.LABEL_AGENT
+            return sig
     return sig
 
 
@@ -108,16 +120,18 @@ def detect_bot_account(author_login: Optional[str]) -> LabelSignal:
     return sig
 
 
-def detect_email_domain(email: Optional[str]) -> LabelSignal:
-    """Look up an author/committer address: exact agent addresses, plus
-    GitHub noreply addresses whose login is a known agent account."""
+def detect_email_domain(email: Optional[str], name: Optional[str] = None) -> LabelSignal:
+    """Look up an author/committer identity: exact agent addresses, GitHub
+    noreply addresses whose login is a known agent account, name+address
+    pairs, and aider's `Name (aider)` suffix (source "email_domain",
+    i.e. the git identity)."""
     sig = LabelSignal()
-    if not email:
-        return sig
-    brand = sig_db.brand_for_email(email)
+    brand = sig_db.brand_for_email(email, name) if email else None
+    if brand is None and name and sig_db.AIDER_NAME_RE.search(name):
+        brand = "aider"
     if brand:
         sig.email_domain_match = True
-        sig.email_domain = email.strip().lower()
+        sig.email_domain = (email or name or "").strip().lower()
         sig.agent_brand = brand
         sig.label_source = "email_domain"
         sig.label = config.LABEL_AGENT
@@ -162,6 +176,8 @@ def resolve_label(
     pr_body: str = "",
     pr_branch_name: str = "",
     pr_labels: Optional[Iterable[str]] = None,
+    author_name: Optional[str] = None,
+    committer_name: Optional[str] = None,
 ) -> LabelSignal:
     """Combine every available signal and resolve a single LabelSignal,
     respecting config.LABEL_SOURCE_PRIORITY for which brand/source gets
@@ -171,9 +187,9 @@ def resolve_label(
     trailer_sig = detect_trailer(commit_message)
     marker_sig = detect_message_marker(commit_message)
     bot_sig = detect_bot_account(author_login)
-    email_sig = detect_email_domain(author_email) if author_email else LabelSignal()
-    if not email_sig.email_domain_match and committer_email:
-        committer_sig = detect_email_domain(committer_email)
+    email_sig = detect_email_domain(author_email, author_name) if (author_email or author_name) else LabelSignal()
+    if not email_sig.email_domain_match and (committer_email or committer_name):
+        committer_sig = detect_email_domain(committer_email, committer_name)
         if committer_sig.email_domain_match:
             email_sig = committer_sig
     pr_sig = detect_pr_marker(pr_title, pr_body, pr_branch_name, pr_labels)
