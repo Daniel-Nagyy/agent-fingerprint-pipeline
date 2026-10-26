@@ -28,8 +28,8 @@ query($owner: String!, $name: String!, $cursor: String, $since: GitTimestamp, $u
         nodes {
           oid message authoredDate committedDate additions deletions changedFilesIfAvailable
           parents(first: 2) { nodes { oid } totalCount }
-          author { name email user { login } }
-          committer { name email }
+          author { name email date user { login } }
+          committer { name email date }
         }
       }
     } } }
@@ -71,9 +71,12 @@ def commit_from_node(full_name: str, node: dict) -> CommitRecord:
         author_email=author.get("email") or None,
         committer_name=committer.get("name") or None,
         committer_email=committer.get("email") or None,
-        author_date=node.get("authoredDate"),
-        commit_date=node.get("committedDate"),
-        message=node.get("message") or "",
+        # author.date / committer.date keep the original timezone offset
+        # (authoredDate is converted to UTC), so hour-of-day features match
+        # clone mode and reflect the author's local time
+        author_date=author.get("date") or node.get("authoredDate"),
+        commit_date=committer.get("date") or node.get("committedDate"),
+        message=(node.get("message") or "").rstrip(),
         parents=parents,
         is_merge=is_merge,
         merge_type="merge" if is_merge else None,

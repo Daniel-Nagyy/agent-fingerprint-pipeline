@@ -40,9 +40,11 @@ _REC_START = "\x02"
 _REC_END = "\x03"
 _FIELD_SEP = "\x1f"
 
+# %B is the raw message exactly as committed (the same text GitHub's API
+# returns), so message features agree between clone and API mode
 _LOG_FORMAT = (
     f"{_REC_START}%H{_FIELD_SEP}%P{_FIELD_SEP}%an{_FIELD_SEP}%ae{_FIELD_SEP}"
-    f"%cn{_FIELD_SEP}%ce{_FIELD_SEP}%aI{_FIELD_SEP}%cI{_FIELD_SEP}%s{_FIELD_SEP}%b{_REC_END}"
+    f"%cn{_FIELD_SEP}%ce{_FIELD_SEP}%aI{_FIELD_SEP}%cI{_FIELD_SEP}%B{_REC_END}"
 )
 
 _LOCK_FILE_NAMES = {
@@ -386,11 +388,8 @@ def _parse_log_output(raw: str, repo_full_name: str) -> List[CommitRecord]:
         fields = header.split(_FIELD_SEP)
         if len(fields) < 9:
             continue
-        sha, parents_str, an, ae, cn, ce, a_date, c_date, subject = fields[:9]
-        body = fields[9] if len(fields) > 9 else ""
-        message = subject
-        if body.strip():
-            message = subject + "\n" + body
+        sha, parents_str, an, ae, cn, ce, a_date, c_date = fields[:8]
+        message = _FIELD_SEP.join(fields[8:]).rstrip()
 
         parents = parents_str.split() if parents_str.strip() else []
         is_merge = len(parents) > 1
@@ -454,7 +453,9 @@ def collect_commits(repo_path: str, repo_full_name: str,
     The filter runs here rather than as `git log --since`, which stops
     walking history at the first commit older than the date and so drops
     in-window commits that sit behind an out-of-order date."""
-    args = ["log", f"--pretty=format:{_LOG_FORMAT}", "--numstat"]
+    # merges are diffed against their first parent, as GitHub's API does
+    # (plain --numstat gives merges no line counts at all)
+    args = ["log", f"--pretty=format:{_LOG_FORMAT}", "--numstat", "--diff-merges=first-parent"]
     if branch:
         args.append(branch)
     raw = _run_git(args, cwd=repo_path, timeout=900)

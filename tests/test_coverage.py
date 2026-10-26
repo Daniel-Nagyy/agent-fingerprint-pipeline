@@ -267,6 +267,43 @@ def test_clone_mode_sizes_depth_from_api_count(monkeypatch):
     assert seen == {"shallow_since": None, "depth": 120}
 
 
+def test_clone_and_api_commit_fields_agree(tmp_path):
+    """Regression (clone vs API on 209 repos): merges had no line counts in
+    clone mode, messages lost their blank line, and API dates were UTC."""
+    import os
+    import subprocess
+    from afp.collect import collect_commits
+    repo = tmp_path / "r"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-03-01T10:00:00+05:30", "GIT_COMMITTER_DATE": "2026-03-01T10:00:00+05:30"}
+    git = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, env=env)
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Dev")
+    git("config", "user.email", "dev@example.com")
+    (repo / "a.py").write_text("a = 1\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "init")
+    git("checkout", "-q", "-b", "feature")
+    (repo / "b.py").write_text("b = 1\nc = 2\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "Add b\n\nBody line.")
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "feature", "-m", "Merge feature")
+    commits = {c.message.splitlines()[0]: c for c in collect_commits(str(repo), "o/r")}
+    merge = commits["Merge feature"]
+    assert merge.is_merge and (merge.additions, merge.files_changed) == (2, 1)   # diff vs first parent
+    assert commits["Add b"].message == "Add b\n\nBody line."                    # raw message, blank line kept
+    assert commits["Add b"].author_date.endswith("+05:30")
+
+    node = {"oid": "x", "message": "Add b\n\nBody line.\n", "authoredDate": "2026-03-01T04:30:00Z",
+            "committedDate": "2026-03-01T04:30:00Z", "additions": 2, "deletions": 0, "changedFilesIfAvailable": 1,
+            "parents": {"nodes": [{"oid": "p"}], "totalCount": 1},
+            "author": {"name": "Dev", "email": "dev@example.com", "date": "2026-03-01T10:00:00+05:30", "user": None},
+            "committer": {"name": "Dev", "email": "dev@example.com", "date": "2026-03-01T10:00:00+05:30"}}
+    api = commit_from_node("o/r", node)
+    assert api.message == commits["Add b"].message and api.author_date == commits["Add b"].author_date
+
+
 # --- token pool -------------------------------------------------------------------
 
 def _resp(status=200, json_data=None, headers=None, text=""):
