@@ -32,6 +32,8 @@ API_ROOT = "https://api.github.com"
 GRAPHQL_URL = f"{API_ROOT}/graphql"
 DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 5
+MAX_RATE_LIMIT_WAITS = 12   # rate-limit pauses per request before giving up
+MAX_INFLIGHT = 24           # requests in flight at once per client (secondary limits punish bursts)
 RATE_LIMIT_RESERVE = 25        # stop and wait when fewer requests than this remain
 MAX_RATE_LIMIT_WAIT = 3700     # never sleep longer than one reset window
 _TRANSIENT_STATUSES = {500, 502, 503, 504}
@@ -41,6 +43,11 @@ log = logging.getLogger("afp.github")
 
 class GitHubAPIError(RuntimeError):
     pass
+
+
+def _empty_ok(resp) -> bool:
+    content = getattr(resp, "content", None)
+    return resp.status_code == 200 and isinstance(content, (bytes, bytearray)) and not content.strip()
 
 
 def _last_page(link_header: str) -> Optional[int]:
@@ -65,7 +72,7 @@ class GitHubClient:
     number of tokens."""
 
     def __init__(self, token: Optional[str] = None, session: Optional[requests.Session] = None,
-                 sleep=time.sleep, tokens: Optional[List[str]] = None):
+                 sleep=time.sleep, tokens: Optional[List[str]] = None, max_inflight: int = MAX_INFLIGHT):
         self.tokens: List[Optional[str]] = list(tokens or ([token] if token else tokens_from_env())) or [None]
         self.token = self.tokens[0]
         self.session = session or requests.Session()
@@ -73,6 +80,7 @@ class GitHubClient:
         self._lock = threading.Lock()
         self._resume_at: Dict[tuple, float] = {}   # (token index, bucket) -> epoch seconds when it refills
         self._remaining: Dict[tuple, int] = {}
+        self._inflight = threading.BoundedSemaphore(max(1, max_inflight))
         self.requests_made = 0
         self.session.headers.update({
             "Accept": "application/vnd.github+json",
@@ -144,33 +152,47 @@ class GitHubClient:
         return None
 
     def _request(self, method: str, url: str, bucket: str, **kwargs) -> requests.Response:
+        """Send with retries. Transient failures (network, 5xx, an empty
+        200 body) use up to MAX_RETRIES attempts. Rate limits do not count
+        as failures: the token is parked until GitHub's reset or
+        Retry-After, and because _pick() waits for a free token, every
+        worker sharing this client pauses together instead of each one
+        hammering the API on its own."""
         last_error = "no response"
-        for attempt in range(MAX_RETRIES):
+        attempt = waits = 0
+        while attempt < MAX_RETRIES and waits < MAX_RATE_LIMIT_WAITS:
             index = self._pick(bucket)
             token = self.tokens[index]
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             resp: Optional[requests.Response] = None
             try:
                 send = self.session.get if method == "GET" else self.session.post
-                resp = send(url, timeout=DEFAULT_TIMEOUT, headers=headers, **kwargs)
+                with self._inflight:
+                    resp = send(url, timeout=DEFAULT_TIMEOUT, headers=headers, **kwargs)
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_error = f"{exc.__class__.__name__}: {exc}"
             with self._lock:
                 self.requests_made += 1
             if resp is not None:
                 self._note_limits(index, bucket, resp)
-            delay = self._retry_delay(resp, attempt)
+            if resp is not None and _empty_ok(resp):
+                delay: Optional[float] = 2.0 ** attempt   # GitHub occasionally sends an empty 200
+            else:
+                delay = self._retry_delay(resp, attempt)
             if delay is None:
                 return resp
-            if resp is not None:
-                last_error = f"HTTP {resp.status_code}"
-            rate_limited = resp is not None and resp.status_code in (403, 429)
-            if rate_limited and len(self.tokens) > 1:
-                # park this token and retry at once on another one
+            if resp is not None and resp.status_code in (403, 429):
+                waits += 1
+                last_error = f"HTTP {resp.status_code} (rate limited)"
                 with self._lock:
-                    self._resume_at[(index, bucket)] = time.time() + delay
+                    self._resume_at[(index, bucket)] = max(self._resume_at.get((index, bucket), 0.0),
+                                                           time.time() + delay)
+                log.warning("GitHub rate limit on token %d (%s): pausing it for %.0f s", index + 1, bucket, delay)
                 continue
-            if attempt < MAX_RETRIES - 1:
+            attempt += 1
+            if resp is not None:
+                last_error = f"HTTP {resp.status_code}" + (" (empty body)" if _empty_ok(resp) else "")
+            if attempt < MAX_RETRIES:
                 log.info("retrying %s %s in %.0f s (%s)", method, url, delay, last_error)
                 self._sleep(min(delay, MAX_RATE_LIMIT_WAIT))
         raise GitHubAPIError(f"Exceeded retries fetching {url} ({last_error})")
@@ -209,7 +231,13 @@ class GitHubClient:
                                  json={"query": query, "variables": variables or {}})
             if resp.status_code != 200:
                 raise GitHubAPIError(f"GraphQL -> {resp.status_code}: {resp.text[:300]}")
-            payload = resp.json()
+            try:
+                payload = resp.json()
+            except ValueError:
+                if attempt < MAX_RETRIES - 1:
+                    self._sleep(2.0 ** attempt)
+                    continue
+                raise GitHubAPIError("GraphQL returned a body that is not JSON")
             errors = payload.get("errors") or []
             if any(e.get("type") == "RATE_LIMITED" for e in errors):
                 if attempt < MAX_RETRIES - 1:

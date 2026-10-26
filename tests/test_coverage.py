@@ -293,6 +293,26 @@ def test_token_pool_switches_token_instead_of_sleeping():
     assert calls[-1] == "Bearer tok-b"
 
 
+def test_rate_limit_waits_do_not_use_up_retries():
+    """Regression (500-repo run): a repo failed after five 5-minute
+    secondary-rate-limit waits. Waits are now separate from failures."""
+    client = GitHubClient(token="t", sleep=lambda s: None)
+    limited = _resp(403, text="You have exceeded a secondary rate limit", headers={"Retry-After": "300"})
+    client.session.get = MagicMock(side_effect=[limited] * 7 + [_resp(200, {"full_name": "o/r"})])
+    assert client.get_repo("o", "r")["full_name"] == "o/r"
+
+
+def test_empty_200_body_is_retried():
+    """Regression (500-repo run): GitHub sent an empty 200 for a tree."""
+    client = GitHubClient(token="t", sleep=lambda s: None)
+    empty = _resp(200)
+    empty.content = b""
+    good = _resp(200, {"tree": [], "truncated": False})
+    good.content = b'{"tree": []}'
+    client.session.get = MagicMock(side_effect=[empty, good])
+    assert client.get_tree("o", "r", "main") == ([], False)
+
+
 def test_token_pool_prefers_token_with_most_budget():
     client = GitHubClient(tokens=["a", "b"])
     client._remaining[(0, "core")] = 100

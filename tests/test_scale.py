@@ -46,7 +46,7 @@ def test_client_waits_out_secondary_rate_limit():
         _resp(200, {"full_name": "o/r"}),
     ])
     client.get_repo("o", "r")
-    assert sleeps == [8.0]
+    assert len(sleeps) == 1 and 7.0 < sleeps[0] <= 8.0   # parked until Retry-After, then retried
 
 
 def test_client_gives_up_after_retries():
