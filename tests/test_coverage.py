@@ -241,6 +241,53 @@ def test_run_pipeline_api_mode_end_to_end():
     assert result.feature_vectors[0].edit_velocity is None   # first commit of its author
 
 
+def test_top_agents_only():
+    """--agents top5: other agents' traces are dropped, and a tool that
+    reuses another agent's address is not credited to that agent."""
+    from afp import signatures as sig_db
+    try:
+        sig_db.set_active_brands(sig_db.TOP_BRANDS)
+        assert resolve_label(commit_message="x\n\nCo-authored-by: Claude <noreply@anthropic.com>").agent_brand \
+            == "claude_code"
+        assert resolve_label(commit_message="x\n\nCo-authored-by: Kimi Code <noreply@anthropic.com>").label \
+            == "unlabeled"
+        assert resolve_label(commit_message="aider: fix", author_name="Ann (aider)").label == "unlabeled"
+        assert resolve_label(author_login="google-labs-jules[bot]").agent_brand == "jules"
+        assert sig_db.file_marker_brand(".windsurfrules") is None
+        assert sig_db.file_marker_brand("CLAUDE.md") == ("CLAUDE.md", "claude_code")
+        assert mentioned_brands("@devin @claude please") == ["claude_code"]
+        assert ".aider.conf.yml" not in repo_scan.candidate_files()
+        assert "requirements.txt" not in repo_scan.candidate_files()
+        texts = {".github/workflows/a.yml": "uses: anthropics/claude-code-action@v1\nrun: pip install aider-chat\n",
+                 "CLAUDE.md": "Never add Co-Authored-By lines to commits.",
+                 ".windsurfrules": "x"}
+        sigs = {(s.kind, s.brand) for s in repo_scan.scan(list(texts), texts.get)}
+        assert sigs == {("workflow", "claude_code"), ("hidden_attribution", "claude_code")}
+    finally:
+        sig_db.set_active_brands(None)
+    assert resolve_label(commit_message="x\n\nCo-authored-by: Kimi Code <noreply@anthropic.com>").agent_brand == "kimi"
+    with pytest.raises(ValueError):
+        sig_db.set_active_brands(["claude_code", "nope"])
+    assert sig_db.ACTIVE_BRANDS is None
+
+
+def test_eligible_only_stops_early():
+    from afp.pipeline import run_pipeline
+
+    class Small(FakeAPI):
+        def get_tree(self, owner, repo, ref):
+            return [{"path": "a.py", "type": "blob", "size": 3_000}], False   # ~94 lines
+
+    small = run_pipeline("o", "r", mode="api", client=Small(), shallow_since="2026-01-01", as_of="2026-06-30",
+                         eligible_only=True)
+    assert small.status == "ineligible" and small.commits == [] and small.adoption is None
+    assert any("total_loc" in r for r in small.eligibility.reasons)
+    big = run_pipeline("o", "r", mode="api", client=FakeAPI(), shallow_since="2026-01-01", as_of="2026-06-30",
+                       eligible_only=True)
+    assert big.status == "ok" and big.adoption.commit_brand_counts == {"claude_code": 1}
+    assert big.repo_metadata.contributor_count == 7
+
+
 def test_clone_mode_sizes_depth_from_api_count(monkeypatch):
     """Regression: --shallow-since lost in-window commits behind merges of
     old branches (46 of 185 corpus repos). With a token the clone is a
@@ -337,6 +384,34 @@ def test_rate_limit_waits_do_not_use_up_retries():
     limited = _resp(403, text="You have exceeded a secondary rate limit", headers={"Retry-After": "300"})
     client.session.get = MagicMock(side_effect=[limited] * 7 + [_resp(200, {"full_name": "o/r"})])
     assert client.get_repo("o", "r")["full_name"] == "o/r"
+
+
+def test_dropped_connections_get_a_longer_backoff():
+    """Regression (benchmark runs): waves of TLS EOF errors failed whole
+    batches after five quick retries; connection errors now get eight,
+    with jittered backoff capped at a minute, while 5xx keep five."""
+    import requests
+    sleeps = []
+    client = GitHubClient(token="t", sleep=sleeps.append)
+    eof = requests.exceptions.SSLError("EOF occurred in violation of protocol")
+    client.session.get = MagicMock(side_effect=[eof] * 7 + [_resp(200, {"full_name": "o/r"})])
+    assert client.get_repo("o", "r")["full_name"] == "o/r"
+    assert len(sleeps) == 7 and max(sleeps) <= 90
+    client.session.get = MagicMock(return_value=_resp(502))
+    with pytest.raises(Exception, match="502"):
+        client.get_repo("o", "r")
+    assert client.session.get.call_count == 5
+
+
+def test_graphql_rate_limit_error_type_is_waited_out():
+    """Regression: GitHub also reports type RATE_LIMIT ("API rate limit
+    already exceeded"), which used to fail the repo instead of waiting."""
+    sleeps = []
+    client = GitHubClient(token="t", sleep=sleeps.append)
+    limited = _resp(200, {"errors": [{"type": "RATE_LIMIT", "message": "API rate limit already exceeded"}]})
+    client.session.post = MagicMock(side_effect=[limited, _resp(200, {"data": {"ok": 1}})])
+    assert client.graphql("{ ok }") == {"ok": 1}
+    assert sleeps == [60.0]
 
 
 def test_empty_200_body_is_retried():

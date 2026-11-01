@@ -23,9 +23,15 @@ name a brand.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Pattern, Tuple
+from typing import Dict, Iterable, List, Optional, Pattern, Tuple
 
 PRIMARY_BRANDS = ("claude_code", "copilot", "codex", "gemini", "cursor")
+
+# The five agents seen most in three 500-repo samples (Feb 2025 - Sep
+# 2026): Claude Code (146 repos), Copilot (60), Codex (17), Cursor (17)
+# and Jules (111 agent commits/PRs; Gemini CLI barely appeared). The CLI
+# checks only these by default (`--agents top5`); see set_active_brands.
+TOP_BRANDS = ("claude_code", "copilot", "codex", "cursor", "jules")
 
 # brand -> (display name, kind). Kinds: primary, cloud, ide, app_builder,
 # review (AI code review / autofix bots), tooling (planning/spec tools
@@ -276,7 +282,7 @@ def login_from_noreply(email: Optional[str]) -> Optional[str]:
 def brand_for_login(login: Optional[str]) -> Optional[str]:
     if not login:
         return None
-    return AGENT_LOGINS.get(login.strip().lower())
+    return keep(AGENT_LOGINS.get(login.strip().lower()))
 
 
 def brand_for_email(email: Optional[str], name: Optional[str] = None) -> Optional[str]:
@@ -289,12 +295,12 @@ def brand_for_email(email: Optional[str], name: Optional[str] = None) -> Optiona
     email_l = email.strip().lower()
     name_l = (name or "").strip().lower()
     if name_l in TOOL_NAME_OVERRIDES and email_l in AGENT_EMAILS:
-        return TOOL_NAME_OVERRIDES[name_l]
+        return keep(TOOL_NAME_OVERRIDES[name_l])
     if email_l in AGENT_EMAILS:
-        return AGENT_EMAILS[email_l]
+        return keep(AGENT_EMAILS[email_l])
     for name_re, pair_email, brand in NAME_EMAIL_PAIRS:
         if email_l == pair_email and name_re.search(name_l):
-            return brand
+            return keep(brand)
     return brand_for_login(login_from_noreply(email_l))
 
 
@@ -423,7 +429,7 @@ def mentioned_brands(text: Optional[str]) -> List[str]:
     found: List[str] = []
     for m in MENTION_RE.finditer(text):
         brand = MENTIONS[m.group(1).lower()]
-        if brand not in found:
+        if is_active(brand) and brand not in found:
             found.append(brand)
     return found
 
@@ -472,17 +478,17 @@ def brand_for_branch(branch: Optional[str]) -> Optional[str]:
     b = branch.strip().lower()
     for prefix, brand in BRANCH_PREFIXES.items():
         if b.startswith(prefix):
-            return brand
+            return keep(brand)
     for pattern, brand in BRANCH_PATTERNS:
         if pattern.search(b):
-            return brand
+            return keep(brand)
     return None
 
 
 def brand_for_label(label: Optional[str]) -> Optional[str]:
     if not label:
         return None
-    return PR_LABELS.get(label.strip().lower())
+    return keep(PR_LABELS.get(label.strip().lower()))
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +544,7 @@ def file_marker_brand(path: str) -> Optional[Tuple[str, str]]:
     if p.startswith("./"):
         p = p[2:]
     base = p.rsplit("/", 1)[-1]
-    for marker, brand in FILE_MARKERS:
+    for marker, brand in DETECT_FILE_MARKERS:
         if marker.startswith("**/"):
             if base == marker[3:] and "/" in p:
                 return marker, brand
@@ -548,3 +554,62 @@ def file_marker_brand(path: str) -> Optional[Tuple[str, str]]:
         elif p == marker:
             return marker, brand
     return None
+
+
+# ---------------------------------------------------------------------------
+# Restricting detection to a few brands
+# ---------------------------------------------------------------------------
+
+# None = every brand. set_active_brands() narrows detection: the pattern
+# lists the detectors loop over are pruned to the active brands, and
+# identity lookups (addresses, logins) still use the full tables -- so a
+# tool that reuses another agent's address (Kimi Code writing as
+# noreply@anthropic.com) resolves to its own brand and is then dropped,
+# rather than being counted as the agent whose address it borrowed. The
+# full tables also stay in use for stripping signals out of commit
+# messages and for telling bot accounts from people.
+ACTIVE_BRANDS: Optional[frozenset] = None
+
+DETECT_TRAILER_NAMES = TRAILER_NAME_PATTERNS
+DETECT_TOOL_TRAILERS = TOOL_TRAILERS
+DETECT_BODY_MARKERS = BODY_MARKER_PATTERNS
+DETECT_SUBJECT_PREFIXES = SUBJECT_PREFIX_PATTERNS
+DETECT_FILE_MARKERS = FILE_MARKERS
+
+
+def is_active(brand: Optional[str]) -> bool:
+    return brand is not None and (ACTIVE_BRANDS is None or brand in ACTIVE_BRANDS)
+
+
+def keep(brand: Optional[str]) -> Optional[str]:
+    """`brand` if it is being detected, else None."""
+    return brand if is_active(brand) else None
+
+
+def set_active_brands(brands: Optional[Iterable[str]]) -> None:
+    """Detect only `brands` (None = all). Unknown brand ids raise."""
+    global ACTIVE_BRANDS, DETECT_TRAILER_NAMES, DETECT_TOOL_TRAILERS, DETECT_BODY_MARKERS, \
+        DETECT_SUBJECT_PREFIXES, DETECT_FILE_MARKERS
+    if brands is None:
+        ACTIVE_BRANDS = None
+    else:
+        chosen = frozenset(brands)
+        unknown = sorted(chosen - set(BRANDS))
+        if unknown:
+            raise ValueError(f"unknown agent id(s): {', '.join(unknown)}")
+        ACTIVE_BRANDS = chosen
+    DETECT_TRAILER_NAMES = [(b, p) for b, p in TRAILER_NAME_PATTERNS if is_active(b)]
+    DETECT_TOOL_TRAILERS = [(p, b) for p, b in TOOL_TRAILERS if is_active(b)]
+    DETECT_BODY_MARKERS = [(b, p) for b, p in BODY_MARKER_PATTERNS if is_active(b)]
+    DETECT_SUBJECT_PREFIXES = [(b, p) for b, p in SUBJECT_PREFIX_PATTERNS if is_active(b)]
+    DETECT_FILE_MARKERS = [(m, b) for m, b in FILE_MARKERS if is_active(b)]
+
+
+def parse_agents(spec: str) -> Optional[List[str]]:
+    """CLI value -> brand list: "top5", "all" (None) or "a,b,c"."""
+    spec = (spec or "").strip().lower()
+    if spec in ("", "all"):
+        return None
+    if spec == "top5":
+        return list(TOP_BRANDS)
+    return [s.strip() for s in spec.split(",") if s.strip()]

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -32,8 +33,9 @@ API_ROOT = "https://api.github.com"
 GRAPHQL_URL = f"{API_ROOT}/graphql"
 DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 5
+MAX_CONNECTION_RETRIES = 8  # dropped connections (TLS EOF, resets) come in waves: back off ~2 minutes
 MAX_RATE_LIMIT_WAITS = 12   # rate-limit pauses per request before giving up
-MAX_INFLIGHT = 24           # requests in flight at once per client (secondary limits punish bursts)
+MAX_INFLIGHT = 32           # requests in flight at once per client (bursts of new connections get dropped)
 RATE_LIMIT_RESERVE = 25        # stop and wait when fewer requests than this remain
 MAX_RATE_LIMIT_WAIT = 3700     # never sleep longer than one reset window
 _TRANSIENT_STATUSES = {500, 502, 503, 504}
@@ -130,7 +132,9 @@ class GitHubClient:
     def _retry_delay(resp: Optional[requests.Response], attempt: int) -> Optional[float]:
         """Seconds to wait before retrying, or None if the response is final."""
         if resp is None:
-            return 2.0 ** attempt
+            # jittered, so workers that lost their connections together
+            # do not all reconnect in the same instant
+            return min(60.0, 2.0 ** attempt) * random.uniform(0.5, 1.5)
         status = resp.status_code
         headers = getattr(resp, "headers", None) or {}
         if status in _TRANSIENT_STATUSES:
@@ -160,7 +164,7 @@ class GitHubClient:
         hammering the API on its own."""
         last_error = "no response"
         attempt = waits = 0
-        while attempt < MAX_RETRIES and waits < MAX_RATE_LIMIT_WAITS:
+        while attempt < MAX_CONNECTION_RETRIES and waits < MAX_RATE_LIMIT_WAITS:
             index = self._pick(bucket)
             token = self.tokens[index]
             headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -192,7 +196,9 @@ class GitHubClient:
             attempt += 1
             if resp is not None:
                 last_error = f"HTTP {resp.status_code}" + (" (empty body)" if _empty_ok(resp) else "")
-            if attempt < MAX_RETRIES:
+                if attempt >= MAX_RETRIES:
+                    break
+            if attempt < MAX_CONNECTION_RETRIES:
                 log.info("retrying %s %s in %.0f s (%s)", method, url, delay, last_error)
                 self._sleep(min(delay, MAX_RATE_LIMIT_WAIT))
         raise GitHubAPIError(f"Exceeded retries fetching {url} ({last_error})")
@@ -239,10 +245,17 @@ class GitHubClient:
                     continue
                 raise GitHubAPIError("GraphQL returned a body that is not JSON")
             errors = payload.get("errors") or []
-            if any(e.get("type") == "RATE_LIMITED" for e in errors):
+            # GitHub reports this as RATE_LIMITED or RATE_LIMIT ("API rate limit
+            # already exceeded") depending on the path; both mean wait for the reset
+            if any(e.get("type") in ("RATE_LIMITED", "RATE_LIMIT") for e in errors):
                 if attempt < MAX_RETRIES - 1:
-                    log.warning("GitHub GraphQL rate limited; waiting 60 s")
-                    self._sleep(60)
+                    try:
+                        reset = float((getattr(resp, "headers", None) or {}).get("X-RateLimit-Reset") or 0)
+                    except ValueError:
+                        reset = 0
+                    wait = min(MAX_RATE_LIMIT_WAIT, max(60.0, reset - time.time() + 1)) if reset else 60.0
+                    log.warning("GitHub GraphQL rate limited; waiting %.0f s", wait)
+                    self._sleep(wait)
                     continue
                 raise GitHubAPIError("GraphQL rate limited after retries")
             not_found = [e for e in errors if e.get("type") == "NOT_FOUND"]

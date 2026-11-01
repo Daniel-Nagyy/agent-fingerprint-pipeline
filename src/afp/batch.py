@@ -115,19 +115,25 @@ def _one_line(result: PipelineResult) -> str:
         if ad.hidden_use:
             agents += " [hidden use]"
     elig = ""
+    if result.status == "ineligible":
+        return "skipped, not eligible (" + "; ".join(result.eligibility.reasons) + ")"
     if result.eligibility is not None:
-        elig = "; eligible" if result.eligibility.eligible else "; not eligible"
+        elig = {True: "; eligible", False: "; not eligible"}.get(result.eligibility.eligible,
+                                                                    "; eligible (LOC estimated)")
     return (f"{len(result.commits)} commits, {len(result.pull_requests)} PRs, {len(result.issues)} agent issues"
             f"{elig}{agents}")
 
 
-def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
+def run_batch(repos: List[str], out_dir: str, *, workers: Optional[int] = None,
               since: Optional[str] = None, until: Optional[str] = None,
               collect_prs: bool = True, max_prs: Optional[int] = None,
               retry_failed: bool = False, keep_clones: bool = False,
               work_dir: Optional[str] = None, limit: Optional[int] = None,
               as_of: Optional[str] = None, mode: str = "clone", collect_issues: bool = True,
-              max_issues: int = 200, max_commits: int = 2000) -> Dict:
+              max_issues: int = 200, max_commits: int = 2000, eligible_only: bool = False,
+              agents: Optional[str] = None) -> Dict:
+    if workers is None:
+        workers = 24 if mode == "api" else 8
     out = Path(out_dir)
     (out / "repos").mkdir(parents=True, exist_ok=True)
     work = Path(work_dir) if work_dir else out / "_clones"
@@ -137,7 +143,7 @@ def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
     skipped_done = skipped_failed = 0
     for name in repos:
         status = _status(out_dir, name)
-        if status == "ok":
+        if status in ("ok", "ineligible"):
             skipped_done += 1
         elif status == "failed" and not retry_failed:
             skipped_failed += 1
@@ -149,7 +155,8 @@ def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
     with open(out / "run_config.json", "w", encoding="utf-8") as f:
         json.dump({"mode": mode, "since": since, "until": until, "as_of": as_of, "collect_prs": collect_prs,
                    "max_prs": max_prs, "collect_issues": collect_issues, "max_issues": max_issues,
-                   "workers": workers, "repos_in_list": len(repos),
+                   "workers": workers, "repos_in_list": len(repos), "eligible_only": eligible_only,
+                   "agents": agents or "all",
                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f, indent=2)
 
     from .github_client import GitHubClient, tokens_from_env
@@ -169,7 +176,7 @@ def run_batch(repos: List[str], out_dir: str, *, workers: int = 4,
         result = run_pipeline(owner, repo, work_dir=str(work), shallow_since=since, until=until,
                               collect_prs=collect_prs, keep_clone=keep_clones, client=client,
                               max_prs=max_prs, as_of=as_of, mode=mode, collect_issues=collect_issues,
-                              max_issues=max_issues, max_commits=max_commits)
+                              max_issues=max_issues, max_commits=max_commits, eligible_only=eligible_only)
         export_jsonl(result, str(repo_dir(out_dir, name)))
         return result
 

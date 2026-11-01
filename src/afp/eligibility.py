@@ -14,6 +14,7 @@ rather than silently dropped.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -57,7 +58,31 @@ def _size_tier(total_loc: Optional[int]) -> Optional[str]:
 def build_repo_metadata(client: GitHubClient, owner: str, repo: str,
                         fetch_contributors: bool = True,
                         fetch_branch_protection: bool = True,
-                        total_loc: Optional[int] = None) -> RepoMetadata:
+                        total_loc: Optional[int] = None,
+                        base: Optional[RepoMetadata] = None) -> RepoMetadata:
+    """`base` is metadata already fetched without the REST lookups
+    (--eligible-only); only the REST lookups are added to it. The three
+    requests are independent of each other and run side by side."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        contributors = pool.submit(client.get_contributors_count, owner, repo) if fetch_contributors else None
+        meta = base or _query_metadata(client, owner, repo, total_loc)
+        review = pool.submit(client.review_required, owner, repo, meta.default_branch) \
+            if fetch_branch_protection else None
+    if contributors is not None:
+        try:
+            meta.contributor_count = contributors.result()
+            meta.is_solo = meta.contributor_count == 1
+        except Exception:
+            meta.contributor_count = None
+    if review is not None:
+        try:
+            meta.branch_protection, meta.branch_protection_source = review.result()
+        except Exception:
+            meta.branch_protection = None
+    return meta
+
+
+def _query_metadata(client: GitHubClient, owner: str, repo: str, total_loc: Optional[int]) -> RepoMetadata:
     data = client.graphql(REPO_QUERY, {"owner": owner, "name": repo})
     raw = data.get("repository")
     if raw is None:
@@ -86,21 +111,6 @@ def build_repo_metadata(client: GitHubClient, owner: str, repo: str,
     )
     meta.stack_tag = config.LANGUAGE_TO_STACK_TAG.get(meta.primary_language or "", meta.primary_language)
     meta.size_tier = _size_tier(meta.total_loc)
-
-    if fetch_contributors:
-        try:
-            meta.contributor_count = client.get_contributors_count(owner, repo)
-            meta.is_solo = meta.contributor_count == 1
-        except Exception:
-            meta.contributor_count = None
-
-    if fetch_branch_protection:
-        try:
-            meta.branch_protection, meta.branch_protection_source = client.review_required(
-                owner, repo, meta.default_branch)
-        except Exception:
-            meta.branch_protection = None
-
     return meta
 
 

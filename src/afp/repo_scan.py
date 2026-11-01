@@ -22,6 +22,7 @@ import re
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .schema import RepoSignal
+from .signatures import is_active
 
 # --- workflows --------------------------------------------------------------
 
@@ -114,7 +115,18 @@ GITIGNORE_ENTRIES: List[Tuple[re.Pattern, str]] = [
 NO_ATTRIBUTION_RE = re.compile(
     r"(?:do not|don't|never|no|without)\b[^\n]{0,60}\b(?:co-?authored|attribution|generated with|ai[- ]generated|claude as)\b",
     re.I)
-GUIDANCE_FILES = ("CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules", ".github/copilot-instructions.md")
+# guidance file -> the agent that reads it (AGENTS.md is shared by several)
+GUIDANCE_FILES: Dict[str, str] = {
+    "CLAUDE.md": "claude_code", "AGENTS.md": "unknown", "GEMINI.md": "gemini", ".cursorrules": "cursor",
+    ".github/copilot-instructions.md": "copilot",
+}
+
+# files read only for one agent's signals (the rest serve several)
+_FILE_BRANDS: Dict[str, str] = {
+    "requirements.txt": "", "requirements-dev.txt": "", "pyproject.toml": "",   # python agents: aider, openhands
+    ".gemini/settings.json": "gemini", ".aider.conf.yml": "aider",
+}
+_PY_AGENTS = set(PY_PACKAGES.values())
 
 # --- agent sub-folders ----------------------------------------------------------
 
@@ -134,11 +146,27 @@ def wanted_paths(paths: Iterable[str]) -> List[str]:
     """The small files scan() needs the text of (at most ~40)."""
     present = set(paths)
     want = [p for p in present if p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))][:25]
-    for p in list(DEPENDENCY_FILES) + list(DEVCONTAINER_FILES) + list(GUIDANCE_FILES) + [
-            ".gitignore", ".claude/settings.json", ".gemini/settings.json", ".aider.conf.yml"]:
+    for p in candidate_files():
         if p in present:
             want.append(p)
     return sorted(set(want))
+
+
+def candidate_files() -> List[str]:
+    """Fixed paths scan() may read, minus those that only matter for
+    agents not being detected (see signatures.set_active_brands)."""
+    out = []
+    for p in list(DEPENDENCY_FILES) + list(DEVCONTAINER_FILES) + list(GUIDANCE_FILES) + [
+            ".gitignore", ".claude/settings.json", ".gemini/settings.json", ".aider.conf.yml"]:
+        brand = _FILE_BRANDS.get(p)
+        if brand == "" and not any(is_active(b) for b in _PY_AGENTS):
+            continue
+        if brand and not is_active(brand):
+            continue
+        if p in GUIDANCE_FILES and not is_active(GUIDANCE_FILES[p]):
+            continue
+        out.append(p)
+    return out
 
 
 def _deps_in(path: str, text: str) -> Iterable[str]:
@@ -164,6 +192,8 @@ def scan(paths: List[str], read: Callable[[str], Optional[str]],
     present = set(paths)
 
     def emit(kind, brand, path, detail, strength="medium"):
+        if not is_active(brand):
+            return
         for s in signals:
             if (s.kind, s.brand, s.path) == (kind, brand, path):
                 return
@@ -241,12 +271,12 @@ def scan(paths: List[str], read: Callable[[str], Optional[str]],
     aider_conf = read(".aider.conf.yml") if ".aider.conf.yml" in present else None
     if aider_conf and re.search(r"^\s*attribute-(?:author|committer)\s*:\s*false", aider_conf, re.I | re.M):
         emit("hidden_attribution", "aider", ".aider.conf.yml", "(aider) name attribution disabled", "strong")
-    for p in GUIDANCE_FILES:
+    for p, brand in GUIDANCE_FILES.items():
         if p in present:
             text = read(p) or ""
             m = NO_ATTRIBUTION_RE.search(text)
             if m:
-                emit("hidden_attribution", "unknown", p, m.group(0)[:120], "medium")
+                emit("hidden_attribution", brand, p, m.group(0)[:120], "medium")
 
     # agent sub-folders
     for prefix, brand in AGENT_DIRS.items():

@@ -73,7 +73,10 @@ python -m afp.cli run spf13/viper --out ./out/viper --since 2026-02-22
 python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --workers 12
 
 # The fast way for many repos: no cloning, everything from the API
-python -m afp.cli batch corpus.csv --out ./out/corpus-api --since 2026-02-22 --mode api --workers 16
+python -m afp.cli batch corpus.csv --out ./out/corpus-api --since 2026-02-22 --mode api
+
+# Fastest: also skip repos that fail the eligibility rules after one query
+python -m afp.cli batch corpus.csv --out ./out/corpus-api --since 2026-02-22 --mode api --eligible-only
 
 # Pilot on the first 20 repos, then run the rest with the same command
 python -m afp.cli batch corpus.csv --out ./out/corpus --since 2026-02-22 --limit 20
@@ -101,8 +104,10 @@ Window options (`run` and `batch`):
 | `--max-issues N` | Newest issues scanned per repo (default 200; `0` = all). |
 | `--no-issues` | Skip issue collection. |
 | `--max-commits N` | API mode: newest commits per repo (default 2000; `0` = all). |
+| `--agents top5\|all\|a,b,c` | Agents to detect. Default `top5`: Claude Code, Copilot, Codex, Cursor and Jules, the five seen most in three 500-repo samples (Feb 2025 – Sep 2026). Every channel is still checked for them; other agents' traces, generic ones (AGENTS.md, an `ai-generated` label) and files only other agents use are skipped. `all` detects every agent in `signatures.py`. |
+| `--eligible-only` | Check the eligibility rules first (one GraphQL query and the file tree, LOC estimated from file sizes) and stop for a repo that fails one: it is saved with status `ineligible`, counted apart from failures, and not re-run on resume. |
 
-Batch-only: `--workers N` (parallel repos, default 4), `--retry-failed`,
+Batch-only: `--workers N` (parallel repos, default 24 in API mode, 8 in clone mode), `--retry-failed`,
 `--limit N`, `--keep-clones`, `--work-dir DIR`.
 
 ### Running on a large corpus
@@ -123,8 +128,16 @@ Batch-only: `--workers N` (parallel repos, default 4), `--retry-failed`,
   per repo); `--mode clone --workers 12` took 12.2 minutes. Both found the
   same 1,378 commits and the same agents. Use API mode to detect adoption
   across many repos, and clone mode for the repos you train on.
-- **Parallel inside each repo.** In clone mode the API calls (metadata,
-  PRs, issues) run while the clone downloads.
+- **Parallel inside each repo.** In API mode metadata, commits, PRs,
+  issues and the file tree are all requested at once (file contents follow
+  the tree), and the contributor count and review rules run side by side;
+  a repo takes as long as its slowest request rather than their sum. In
+  clone mode the API calls run while the clone downloads.
+- **What limits a big run.** Each repo costs about 2 GraphQL points and
+  3–4 REST requests; GitHub allows 5,000 of each per token per hour, so
+  one token tops out near 1,200 repos/hour however many workers run. Add
+  tokens (`GITHUB_TOKENS`) to go past that, and `--eligible-only` to spend
+  only one query and one REST call on repos the study drops anyway.
 - **More tokens, more throughput.** With `GITHUB_TOKENS` the API budget is
   the sum of all tokens (5,000 requests and 5,000 GraphQL points per hour
   each).
@@ -322,7 +335,7 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-176 tests. They cover:
+183 tests. They cover:
 
 - the signature roster, with real true and false positives;
 - label priority and PR propagation;

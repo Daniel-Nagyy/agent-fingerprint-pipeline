@@ -327,7 +327,8 @@ def merge_corpus(out_dir: str) -> Dict[str, Any]:
     report = {
         "repos_total": len(summaries),
         "repos_ok": len(ok),
-        "repos_failed": len(summaries) - len(ok),
+        "repos_failed": sum(1 for s in summaries if s.get("status") == "failed"),
+        "repos_skipped_ineligible": sum(1 for s in summaries if s.get("status") == "ineligible"),
         "repos_eligible": len(eligible),
         "repos_eligible_unchecked": sum(1 for s in ok if (s.get("eligibility") or {}).get("eligible") is None
                                         and s.get("eligibility")),
@@ -347,7 +348,9 @@ def merge_corpus(out_dir: str) -> Dict[str, Any]:
 def format_report(report: Dict[str, Any]) -> str:
     ok = report["repos_ok"] or 1
     lines = [
-        f"Repos processed: {report['repos_ok']} ok, {report['repos_failed']} failed "
+        f"Repos processed: {report['repos_ok']} ok, {report['repos_failed']} failed"
+        + (f", {report['repos_skipped_ineligible']} skipped as ineligible"
+           if report.get("repos_skipped_ineligible") else "") + " "
         f"({report['repos_eligible']} meet every eligibility rule"
         + (f", {report['repos_eligible_unchecked']} pass the rules that could be checked"
            if report.get("repos_eligible_unchecked") else "") + ")",

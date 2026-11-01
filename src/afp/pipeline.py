@@ -37,6 +37,7 @@ from .collect import (clone_repo, code_bytes, collect_commits, compute_edit_velo
 from .features import commits_to_feature_vectors
 from .heuristics import apply_pr_label
 from .schema import EligibilityResult, FileMarker, RepoAdoption, RepoMetadata
+from . import signatures as sig_db
 from .signatures import file_marker_brand
 
 MODES = ("clone", "api")
@@ -119,12 +120,16 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
                  until: Optional[str] = None, client=None,
                  max_prs: Optional[int] = None, as_of: Optional[str] = None,
                  mode: str = "clone", collect_issues: bool = True,
-                 max_issues: int = 200, max_commits: int = 2000) -> PipelineResult:
+                 max_issues: int = 200, max_commits: int = 2000,
+                 eligible_only: bool = False) -> PipelineResult:
     """Run every stage for one repo. `shallow_since`/`until` (YYYY-MM-DD)
     bound the commit, PR and issue window; `as_of` (YYYY-MM-DD, default
     today) is the date "pushed in the last 12 months" is measured from;
     `client` lets a batch share one rate-limited GitHubClient (and its
-    token pool) across workers (default: built from GITHUB_TOKEN(S))."""
+    token pool) across workers (default: built from GITHUB_TOKEN(S)).
+    `eligible_only` checks the methodology rules first (one query plus
+    the file tree) and stops for a repo that fails one (status
+    "ineligible"): no clone, commits, PRs or issues for it."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     full_name = f"{owner}/{repo}"
@@ -137,13 +142,52 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
             client = GitHubClient()
     if mode == "api" and client is None:
         raise ValueError("--mode api needs GITHUB_TOKEN or GITHUB_TOKENS")
+    if eligible_only and client is None:
+        raise ValueError("--eligible-only needs GITHUB_TOKEN or GITHUB_TOKENS")
+    now = datetime.fromisoformat(f"{as_of}T23:59:59+00:00") if as_of else None
+    if sig_db.ACTIVE_BRANDS is not None:
+        result.notes.append("agents checked: " + ", ".join(sorted(sig_db.ACTIVE_BRANDS)))
 
-    # --- API stage, started first so it overlaps the clone ---------------
-    pool = ThreadPoolExecutor(max_workers=3) if client is not None else None
+    pool = ThreadPoolExecutor(max_workers=6) if client is not None else None
+    try:
+        return _run(result, owner, repo, work_dir, branch, shallow_since, until, collect_prs, keep_clone,
+                    client, max_prs, mode, collect_issues, max_issues, max_commits, eligible_only, now, pool)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _run(result, owner, repo, work_dir, branch, shallow_since, until, collect_prs, keep_clone,
+         client, max_prs, mode, collect_issues, max_issues, max_commits, eligible_only, now,
+         pool) -> PipelineResult:
+    from .eligibility import _size_tier, build_repo_metadata, check_eligibility
+    full_name = result.full_name
     futures: Dict[str, Any] = {}
+    if mode == "api" or eligible_only:
+        futures["tree"] = pool.submit(client.get_tree, owner, repo, "HEAD")
+
+    # --- 0. eligibility first, if asked ----------------------------------
+    early_meta = None
+    if eligible_only:
+        early_meta = build_repo_metadata(client, owner, repo, fetch_contributors=False,
+                                         fetch_branch_protection=False)
+        entries, truncated = futures["tree"].result()
+        if not truncated:
+            early_meta.total_loc = round(code_bytes([(e["path"], e.get("size") or 0) for e in entries])
+                                         / config.BYTES_PER_LOC)
+            early_meta.loc_estimated = True
+            early_meta.size_tier = _size_tier(early_meta.total_loc)
+        verdict = check_eligibility(early_meta, now=now)
+        if verdict.eligible is False:
+            result.repo_metadata, result.eligibility = early_meta, verdict
+            result.status, result.mode = "ineligible", mode
+            result.notes.append("skipped after the eligibility check (--eligible-only)")
+            return result
+
+    # --- API stage: every request that does not need another one's answer
+    # starts now, side by side (in clone mode, alongside the clone) -------
     if pool is not None:
-        from .eligibility import build_repo_metadata
-        futures["meta"] = pool.submit(build_repo_metadata, client, owner, repo)
+        futures["meta"] = pool.submit(build_repo_metadata, client, owner, repo, base=early_meta)
         if collect_prs:
             from .pr_collect import collect_pull_requests
             futures["prs"] = pool.submit(collect_pull_requests, client, owner, repo,
@@ -152,6 +196,13 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
             from .issue_collect import collect_issues as _collect_issues
             futures["issues"] = pool.submit(_collect_issues, client, owner, repo,
                                             since=shallow_since, until=until, max_issues=max_issues)
+    if mode == "api":
+        from .api_collect import collect_commits_api
+        futures["commits"] = pool.submit(collect_commits_api, client, owner, repo, since=shallow_since,
+                                         until=until, max_commits=max_commits)
+        tree_future = futures["tree"]
+        futures["texts"] = pool.submit(lambda: client.get_blobs(
+            owner, repo, repo_scan.wanted_paths(e["path"] for e in tree_future.result()[0])))
 
     tmp_ctx = None
     if work_dir is None:
@@ -191,11 +242,8 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
             result.signals = repo_scan.scan(paths, texts.get, added=lambda p: first_added(clone_path, p)[1])
         else:
             # --- 1. API-only: commits, tree and file contents -------------
-            from .api_collect import collect_commits_api
-            commits = collect_commits_api(client, owner, repo, since=shallow_since, until=until,
-                                          max_commits=max_commits)
-            meta_now = futures["meta"].result()
-            entries, truncated = client.get_tree(owner, repo, meta_now.default_branch)
+            commits = futures["commits"].result()
+            entries, truncated = futures["tree"].result()
             paths = [e["path"] for e in entries]
             if truncated:
                 result.notes.append("file tree truncated by GitHub (very large repo); some files may be missed")
@@ -203,7 +251,7 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
             n_code_bytes = code_bytes([(e["path"], e.get("size") or 0) for e in entries])
             if not truncated:
                 total_loc, loc_estimated = round(n_code_bytes / config.BYTES_PER_LOC), True
-            texts = client.get_blobs(owner, repo, repo_scan.wanted_paths(paths))
+            texts = futures["texts"].result()
             result.signals = repo_scan.scan(paths, texts.get)
             result.notes.append("api mode: no clone, so LOC is estimated from file sizes, and changed "
                                 "paths (file-type mix) and file first-added dates are not available")
@@ -216,7 +264,6 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
         # --- 2. collect the API stage -----------------------------------
         if pool is not None:
             try:
-                from .eligibility import _size_tier, check_eligibility
                 meta = futures["meta"].result()
                 meta.total_loc = total_loc
                 meta.code_bytes, meta.loc_estimated = n_code_bytes, loc_estimated
@@ -224,7 +271,6 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
                 if meta.commit_count is None and git_commit_count is not None:
                     meta.commit_count, meta.commit_count_source = git_commit_count, "git"
                 result.repo_metadata = meta
-                now = datetime.fromisoformat(f"{as_of}T23:59:59+00:00") if as_of else None
                 result.eligibility = check_eligibility(meta, now=now)
                 result.mode = "full" if mode == "clone" else "api"
                 if "prs" in futures:
@@ -258,8 +304,6 @@ def run_pipeline(owner: str, repo: str, work_dir: Optional[str] = None,
                                          signals=result.signals, issues=result.issues)
 
     finally:
-        if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=True)
         if mode == "clone" and not keep_clone:
             remove_tree(clone_path)
         if tmp_ctx is not None and not keep_clone:

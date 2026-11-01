@@ -42,6 +42,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         collect_issues=not args.no_issues,
         max_issues=args.max_issues,
         max_commits=args.max_commits,
+        eligible_only=args.eligible_only,
     )
     paths = export_jsonl(result, args.out)
     print(f"Mode: {result.mode}")
@@ -74,7 +75,8 @@ def _cmd_batch(args: argparse.Namespace) -> int:
                   collect_prs=not args.no_prs, max_prs=args.max_prs, retry_failed=args.retry_failed,
                   keep_clones=args.keep_clones, work_dir=args.work_dir, limit=args.limit,
                   as_of=args.as_of, mode=args.mode, collect_issues=not args.no_issues,
-                  max_issues=args.max_issues, max_commits=args.max_commits)
+                  max_issues=args.max_issues, max_commits=args.max_commits,
+                  eligible_only=args.eligible_only, agents=args.agents)
     except KeyboardInterrupt:
         print("Interrupted. Re-run the same command to resume.", file=sys.stderr)
         return 130
@@ -146,6 +148,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--max-commits", type=int, default=2000, help="api mode: newest commits per repo (0 = all)")
         p.add_argument("--as-of", type=_date, default=None,
                        help="date the 12-month push-recency rule is measured from (default today)")
+        p.add_argument("--agents", default="top5",
+                       help="agents to detect: top5 (default: claude_code, copilot, codex, cursor, jules), "
+                            "all, or a comma list of agent ids")
+        p.add_argument("--eligible-only", action="store_true",
+                       help="check the eligibility rules first and skip the rest for repos that fail one")
 
     p_run = sub.add_parser("run", help="Run the full pipeline on one repo")
     p_run.add_argument("repo", help="owner/repo, e.g. octocat/Hello-World")
@@ -158,7 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("repos", help="corpus CSV with a full_name column (e.g. a gitcorpus export) "
                                        "or a text file with one owner/repo per line")
     p_batch.add_argument("--out", required=True, help="output directory for the corpus")
-    p_batch.add_argument("--workers", type=int, default=4, help="repos processed in parallel (default 4)")
+    p_batch.add_argument("--workers", type=int, default=None,
+                         help="repos processed in parallel (default 24 in api mode, 8 in clone mode)")
     p_batch.add_argument("--retry-failed", action="store_true", help="re-run repos that failed before")
     p_batch.add_argument("--keep-clones", action="store_true", help="keep clones instead of deleting each one")
     p_batch.add_argument("--work-dir", default=None, help="where clones go (default <out>/_clones)")
@@ -188,6 +196,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if hasattr(args, "agents"):
+        from .signatures import parse_agents, set_active_brands
+        try:
+            set_active_brands(parse_agents(args.agents))
+        except ValueError as exc:
+            parser.error(str(exc))
     return args.func(args)
 
 

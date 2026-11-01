@@ -32,7 +32,7 @@ def _trailer_brand(name: str, email: str) -> Optional[str]:
     brand = sig_db.brand_for_email(email, name)
     if brand:
         return brand
-    for brand, pattern in sig_db.TRAILER_NAME_PATTERNS:
+    for brand, pattern in sig_db.DETECT_TRAILER_NAMES:
         if pattern.search(name):
             return brand
     return None
@@ -61,7 +61,7 @@ def detect_trailer(commit_message: str) -> LabelSignal:
         if not sig.has_trailer:
             sig.has_trailer = True
             sig.trailer_text = m.group(0).strip()
-    for pattern, brand in sig_db.TOOL_TRAILERS:
+    for pattern, brand in sig_db.DETECT_TOOL_TRAILERS:
         m = pattern.search(commit_message)
         if m:
             sig.has_trailer = True
@@ -81,13 +81,13 @@ def detect_message_marker(text: str) -> LabelSignal:
         return sig
     subject = text.splitlines()[0]
     match = None
-    for brand, pattern in sig_db.SUBJECT_PREFIX_PATTERNS:
+    for brand, pattern in sig_db.DETECT_SUBJECT_PREFIXES:
         m = pattern.search(subject)
         if m:
             match = (brand, m.group(0))
             break
     if match is None:
-        for brand, pattern in sig_db.BODY_MARKER_PATTERNS:
+        for brand, pattern in sig_db.DETECT_BODY_MARKERS:
             m = pattern.search(text)
             if m:
                 match = (brand, m.group(0))
@@ -128,7 +128,7 @@ def detect_email_domain(email: Optional[str], name: Optional[str] = None) -> Lab
     sig = LabelSignal()
     brand = sig_db.brand_for_email(email, name) if email else None
     if brand is None and name and sig_db.AIDER_NAME_RE.search(name):
-        brand = "aider"
+        brand = sig_db.keep("aider")
     if brand:
         sig.email_domain_match = True
         sig.email_domain = (email or name or "").strip().lower()
